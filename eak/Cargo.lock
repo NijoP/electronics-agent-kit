@@ -166,6 +166,7 @@ name = "eak-compiler"
 version = "0.1.0"
 dependencies = [
  "eak-domain",
+ "eak-units",
  "serde",
 ]
 
@@ -224,6 +225,7 @@ version = "0.1.0"
 dependencies = [
  "eak-domain",
  "eak-ports",
+ "eak-units",
  "serde",
  "serde_json",
 ]

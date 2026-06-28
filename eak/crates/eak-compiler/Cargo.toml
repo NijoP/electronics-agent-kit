@@ -8,3 +8,6 @@ rust-version.workspace = true
 [dependencies]
 serde = { workspace = true }
 eak-domain = { workspace = true }
+
+[dev-dependencies]
+eak-units = { workspace = true }

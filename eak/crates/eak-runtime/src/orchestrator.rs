@@ -131,8 +131,8 @@ mod tests {
     use crate::fsm::{MachineError, StepResult};
     use crate::protocol::{Autonomy, CapabilityAck, CapabilityError, CapabilityRequest};
     use eak_domain::{
-        BomLineItem, Component, Constraint, DesignIntent, EntityId, FunctionalBlock, Net, Part,
-        Pin, ProvenanceLink, Requirement, Violation,
+        Board, BomLineItem, Component, Constraint, DesignIntent, EntityId, FunctionalBlock, Net,
+        Part, Pin, Placement, ProvenanceLink, Requirement, Violation,
     };
     use eak_ports::{Event, ReasoningError, ReasoningRequest, ReasoningResponse, Seq, StoreError};
 
@@ -180,6 +180,12 @@ mod tests {
             vec![]
         }
         fn bom_line_items(&self) -> Vec<BomLineItem> {
+            vec![]
+        }
+        fn board(&self) -> Option<Board> {
+            None
+        }
+        fn placements(&self) -> Vec<Placement> {
             vec![]
         }
         fn reason(

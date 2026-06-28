@@ -10,3 +10,10 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 eak-domain = { workspace = true }
 eak-ports = { workspace = true }
+
+# Test-only: the PCB kernel test constructs typed PhysicalQuantity board/placement
+# dimensions (P9). Production runtime code passes Board/Placement opaquely and never
+# inspects their units, so eak-units stays out of the shipped dependency graph. eak-units
+# is the innermost ring, so this remains an inward edge (P1).
+[dev-dependencies]
+eak-units = { workspace = true }

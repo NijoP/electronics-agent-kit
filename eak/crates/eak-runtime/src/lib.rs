@@ -51,14 +51,15 @@ mod dependency_rule {
 mod kernel_tests {
     use super::*;
     use eak_domain::{
-        BomLineItem, Component, ComponentClass, Decision, EntityId, FunctionalBlock, Net, NetClass,
-        Part, PartLifecycle, Pin, PinElectricalType, Priority, Requirement, RequirementCategory,
-        RequirementStatus,
+        Board, BoardSide, BomLineItem, Component, ComponentClass, Decision, EntityId,
+        FunctionalBlock, Net, NetClass, Part, PartLifecycle, Pin, PinElectricalType, Placement,
+        Priority, Requirement, RequirementCategory, RequirementStatus,
     };
     use eak_ports::{
         Event, EventLog, EventRecord, ReasoningEngine, ReasoningError, ReasoningRequest,
         ReasoningResponse, Seq, StoreError, Timestamp,
     };
+    use eak_units::{PhysicalQuantity, Unit};
 
     struct MemLog {
         records: Vec<EventRecord>,
@@ -362,6 +363,121 @@ mod kernel_tests {
         assert_eq!(core.state.canonical_json(), replayed.canonical_json());
     }
 
+    /// Drive the full chain down into the PCB layer: requirement -> block -> component, then
+    /// a [`Board`] outline and a [`Placement`] of that real component on it. Asserts the fold
+    /// landed (board + placement) and that replay reconstructs byte-identical state (the
+    /// Phase-1 exit criterion, extended to the PCB deltas).
+    #[test]
+    fn phase3_pcb_commits_fold_and_replay_byte_identically() {
+        let mut core = new_core();
+        core.capture_intent(
+            "USB-C powered IoT sensor node, fits a 50x40 mm board",
+            "engineer",
+        )
+        .unwrap();
+        let src = core.state.intent.as_ref().unwrap().id;
+        let rid = core.fresh_id();
+        let did = core.fresh_id();
+        core.invoke(CapabilityRequest::CreateRequirement {
+            requirement: Requirement {
+                id: rid,
+                statement: "Device shall fit a 50x40 mm outline".into(),
+                category: RequirementCategory::Electrical,
+                priority: Priority::High,
+                acceptance_criterion: "board <= 50x40 mm".into(),
+                status: RequirementStatus::Accepted,
+                source: src,
+                targets: vec![],
+            },
+            decision: Decision {
+                id: did,
+                subject: rid,
+                rationale: "from intent".into(),
+                decider: "test".into(),
+                reasoning_call_seq: None,
+                evidence: vec![],
+                confidence: 1.0,
+            },
+            evidence: vec![],
+            links: vec![],
+        })
+        .unwrap();
+
+        let block = FunctionalBlock {
+            id: core.fresh_id(),
+            name: "3V3 regulation".into(),
+            function: "step VBUS down to 3.3 V".into(),
+            requirements: vec![rid],
+        };
+        let bid = block.id;
+        core.invoke(CapabilityRequest::CreateFunctionalBlock {
+            block,
+            links: vec![],
+        })
+        .unwrap();
+
+        let comp = Component {
+            id: core.fresh_id(),
+            refdes: "U1".into(),
+            class: ComponentClass::Regulator,
+            value: None,
+            from_block: bid,
+        };
+        let cid = comp.id;
+        let pin = Pin {
+            id: core.fresh_id(),
+            component: cid,
+            designation: "VOUT".into(),
+            electrical_type: PinElectricalType::PowerOut,
+        };
+        core.invoke(CapabilityRequest::RealizeComponent {
+            component: comp,
+            pins: vec![pin],
+            links: vec![],
+        })
+        .unwrap();
+
+        // The PCB layer: the board outline must precede any placement (seam ordering, P5).
+        let board = Board {
+            id: core.fresh_id(),
+            width: PhysicalQuantity::new(50.0, Unit::Millimetre),
+            height: PhysicalQuantity::new(40.0, Unit::Millimetre),
+            layers: 2,
+        };
+        let board_id = board.id;
+        core.invoke(CapabilityRequest::CreateBoard {
+            board,
+            links: vec![],
+        })
+        .unwrap();
+
+        let placement = Placement {
+            id: core.fresh_id(),
+            component: cid,
+            x: PhysicalQuantity::new(5.0, Unit::Millimetre),
+            y: PhysicalQuantity::new(5.0, Unit::Millimetre),
+            width: PhysicalQuantity::new(10.0, Unit::Millimetre),
+            height: PhysicalQuantity::new(8.0, Unit::Millimetre),
+            side: BoardSide::Top,
+        };
+        let placement_id = placement.id;
+        core.invoke(CapabilityRequest::PlaceComponent {
+            placement,
+            links: vec![],
+        })
+        .unwrap();
+
+        assert!(core.state.board.is_some());
+        assert_eq!(core.state.placements.len(), 1);
+        assert!(core.state.board().is_some());
+        assert_eq!(core.state.board().unwrap().id, board_id);
+        assert!(core.state.placement(placement_id).is_some());
+
+        let replayed = replay(core.log()).unwrap();
+        assert_eq!(core.state, replayed);
+        assert_eq!(core.state.canonical_json(), replayed.canonical_json());
+    }
+
     /// The BOM seam mirrors the synthesis seam: a line with zero quantity, an empty component
     /// list, an unknown part, or an unknown component is rejected before the commit path.
     #[test]
@@ -505,5 +621,156 @@ mod kernel_tests {
         assert!(core.state.functional_blocks.is_empty());
         assert!(core.state.components.is_empty());
         assert!(core.state.nets.is_empty());
+    }
+
+    #[test]
+    fn phase3_pcb_handlers_reject_untraceable_proposals_at_the_seam() {
+        let mut core = new_core();
+
+        // Placing a component before any board outline exists is rejected (board precedes
+        // placement — there is nothing to fit against).
+        let (pid0, cid0) = (core.fresh_id(), core.fresh_id());
+        let err = core
+            .invoke(CapabilityRequest::PlaceComponent {
+                placement: Placement {
+                    id: pid0,
+                    component: cid0,
+                    x: PhysicalQuantity::new(0.0, Unit::Millimetre),
+                    y: PhysicalQuantity::new(0.0, Unit::Millimetre),
+                    width: PhysicalQuantity::new(1.0, Unit::Millimetre),
+                    height: PhysicalQuantity::new(1.0, Unit::Millimetre),
+                    side: BoardSide::Top,
+                },
+                links: vec![],
+            })
+            .unwrap_err();
+        assert!(matches!(err, CapabilityError::Rejected(_)));
+
+        // Commit a board, then reject a second — a design has exactly one outline.
+        let board0 = core.fresh_id();
+        core.invoke(CapabilityRequest::CreateBoard {
+            board: Board {
+                id: board0,
+                width: PhysicalQuantity::new(50.0, Unit::Millimetre),
+                height: PhysicalQuantity::new(50.0, Unit::Millimetre),
+                layers: 2,
+            },
+            links: vec![],
+        })
+        .unwrap();
+        let board1 = core.fresh_id();
+        let err = core
+            .invoke(CapabilityRequest::CreateBoard {
+                board: Board {
+                    id: board1,
+                    width: PhysicalQuantity::new(20.0, Unit::Millimetre),
+                    height: PhysicalQuantity::new(20.0, Unit::Millimetre),
+                    layers: 2,
+                },
+                links: vec![],
+            })
+            .unwrap_err();
+        assert!(matches!(err, CapabilityError::Rejected(_)));
+
+        // Placing an unrealized component is rejected (referential integrity).
+        let (pid1, cid1) = (core.fresh_id(), core.fresh_id());
+        let err = core
+            .invoke(CapabilityRequest::PlaceComponent {
+                placement: Placement {
+                    id: pid1,
+                    component: cid1,
+                    x: PhysicalQuantity::new(1.0, Unit::Millimetre),
+                    y: PhysicalQuantity::new(1.0, Unit::Millimetre),
+                    width: PhysicalQuantity::new(1.0, Unit::Millimetre),
+                    height: PhysicalQuantity::new(1.0, Unit::Millimetre),
+                    side: BoardSide::Top,
+                },
+                links: vec![],
+            })
+            .unwrap_err();
+        assert!(matches!(err, CapabilityError::Rejected(_)));
+
+        // Build a real requirement -> block -> component, place it once, then reject a second
+        // placement of the same component (a component is placed exactly once).
+        core.capture_intent("intent", "engineer").unwrap();
+        let src = core.state.intent.as_ref().unwrap().id;
+        let rid = core.fresh_id();
+        let did = core.fresh_id();
+        core.invoke(CapabilityRequest::CreateRequirement {
+            requirement: Requirement {
+                id: rid,
+                statement: "Device shall do a thing".into(),
+                category: RequirementCategory::Functional,
+                priority: Priority::High,
+                acceptance_criterion: "it does the thing".into(),
+                status: RequirementStatus::Accepted,
+                source: src,
+                targets: vec![],
+            },
+            decision: Decision {
+                id: did,
+                subject: rid,
+                rationale: "from intent".into(),
+                decider: "test".into(),
+                reasoning_call_seq: None,
+                evidence: vec![],
+                confidence: 1.0,
+            },
+            evidence: vec![],
+            links: vec![],
+        })
+        .unwrap();
+        let block_id = core.fresh_id();
+        core.invoke(CapabilityRequest::CreateFunctionalBlock {
+            block: FunctionalBlock {
+                id: block_id,
+                name: "blk".into(),
+                function: "f".into(),
+                requirements: vec![rid],
+            },
+            links: vec![],
+        })
+        .unwrap();
+        let comp_id = core.fresh_id();
+        let pin_id = core.fresh_id();
+        core.invoke(CapabilityRequest::RealizeComponent {
+            component: Component {
+                id: comp_id,
+                refdes: "U1".into(),
+                class: ComponentClass::Ic,
+                value: None,
+                from_block: block_id,
+            },
+            pins: vec![Pin {
+                id: pin_id,
+                component: comp_id,
+                designation: "VDD".into(),
+                electrical_type: PinElectricalType::PowerIn,
+            }],
+            links: vec![],
+        })
+        .unwrap();
+
+        let place = |id: EntityId| CapabilityRequest::PlaceComponent {
+            placement: Placement {
+                id,
+                component: comp_id,
+                x: PhysicalQuantity::new(2.0, Unit::Millimetre),
+                y: PhysicalQuantity::new(2.0, Unit::Millimetre),
+                width: PhysicalQuantity::new(3.0, Unit::Millimetre),
+                height: PhysicalQuantity::new(3.0, Unit::Millimetre),
+                side: BoardSide::Top,
+            },
+            links: vec![],
+        };
+        let p1 = core.fresh_id();
+        core.invoke(place(p1)).unwrap();
+        let p2 = core.fresh_id();
+        let err = core.invoke(place(p2)).unwrap_err();
+        assert!(matches!(err, CapabilityError::Rejected(_)));
+
+        // Exactly one placement landed, on the single committed board.
+        assert_eq!(core.state.placements.len(), 1);
+        assert!(core.state.board.is_some());
     }
 }

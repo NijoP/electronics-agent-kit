@@ -5,8 +5,8 @@
 //! via a [`CapabilityRequest`] (P2). Agents never touch state or a model directly.
 
 use eak_domain::{
-    BomLineItem, Component, Constraint, Decision, DesignIntent, EntityId, Evidence,
-    FunctionalBlock, Net, Part, Pin, ProvenanceLink, Requirement, Violation, Waiver,
+    Board, BomLineItem, Component, Constraint, Decision, DesignIntent, EntityId, Evidence,
+    FunctionalBlock, Net, Part, Pin, Placement, ProvenanceLink, Requirement, Violation, Waiver,
 };
 use eak_ports::{Event, ReasoningError, ReasoningRequest, ReasoningResponse, Seq, StoreError};
 
@@ -98,6 +98,20 @@ pub enum CapabilityRequest {
         item: BomLineItem,
         links: Vec<ProvenanceLink>,
     },
+    /// Commit the single [`Board`] outline the design must fit within, with its provenance
+    /// links (Phase 3 PCB). The runtime re-validates the outline and rejects a second board
+    /// at the seam — a design has exactly one outline.
+    CreateBoard {
+        board: Board,
+        links: Vec<ProvenanceLink>,
+    },
+    /// Place one [`Component`] on the board, with its provenance links (Phase 3 PCB). The
+    /// runtime re-validates the courtyard, checks the component exists, requires the board to
+    /// exist first, and rejects a second placement of the same component at the seam.
+    PlaceComponent {
+        placement: Placement,
+        links: Vec<ProvenanceLink>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -141,6 +155,10 @@ pub trait AgentContext {
     fn parts(&self) -> Vec<Part>;
     /// Phase 3 (BOM): read the committed BOM line items.
     fn bom_line_items(&self) -> Vec<BomLineItem>;
+    /// Phase 3 (PCB): read the committed board outline, if one exists yet.
+    fn board(&self) -> Option<Board>;
+    /// Phase 3 (PCB): read the committed component placements (DRC + PCB IR input).
+    fn placements(&self) -> Vec<Placement>;
     /// Call the reasoning engine, record the call (returning its event [`Seq`]), and
     /// return the judgement. Recording here is what makes replay deterministic (P4).
     fn reason(&mut self, req: ReasoningRequest)

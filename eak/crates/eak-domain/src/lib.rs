@@ -450,6 +450,89 @@ impl BomLineItem {
     }
 }
 
+// ===================== Phase 3 (increment 3): PCB entities =====================
+//
+// The PCB layer places the abstract schematic onto a physical substrate: a [`Board`] is
+// the rectangular outline (with a layer count) the design must fit within; a [`Placement`]
+// binds one [`Component`] to a position, courtyard extent, and [`BoardSide`] on that board.
+// Physical values are typed [`PhysicalQuantity`]s (P9), compared via `si_magnitude()` so
+// DRC checks (out-of-bounds, courtyard overlap) are dimensionally unambiguous. Referential
+// integrity (component exists, board precedes placement) is re-checked at the capability
+// seam (P3). See `docs/engineering/pcb-model.md`.
+
+/// Which copper side of the [`Board`] a [`Placement`] sits on. Two courtyards only collide
+/// when they share a side, so this drives the courtyard-overlap DRC rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum BoardSide {
+    Top,
+    Bottom,
+}
+
+/// The physical board outline the design must fit within: a rectangle of `width` x `height`
+/// with a copper-layer count. Dimensions are typed [`PhysicalQuantity`]s (P9), so placement
+/// DRC stays dimensionally unambiguous; hence `Board` is not `Eq`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Board {
+    pub id: EntityId,
+    pub width: PhysicalQuantity,
+    pub height: PhysicalQuantity,
+    pub layers: u32,
+}
+
+impl Board {
+    /// Domain invariants: the outline has positive dimensions and at least one copper layer.
+    /// Dimensions are compared via `si_magnitude()` so the check is unit-independent (P9).
+    pub fn validate(&self) -> Result<(), DomainError> {
+        if !self.width.si_magnitude().is_finite()
+            || !self.height.si_magnitude().is_finite()
+            || self.width.si_magnitude() <= 0.0
+            || self.height.si_magnitude() <= 0.0
+        {
+            return Err(DomainError::Inconsistent(
+                "board dimensions must be positive and finite",
+            ));
+        }
+        if self.layers == 0 {
+            return Err(DomainError::Inconsistent(
+                "board must have at least one layer",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// The placement of one [`Component`] on a [`Board`]: an origin (`x`, `y`), a courtyard
+/// extent (`width` x `height`), and the [`BoardSide`] it occupies. Positions and extents are
+/// typed [`PhysicalQuantity`]s (P9), so `Placement` is not `Eq`. Component-link and
+/// board-precedence integrity are re-checked at the capability seam (P3).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Placement {
+    pub id: EntityId,
+    pub component: EntityId,
+    pub x: PhysicalQuantity,
+    pub y: PhysicalQuantity,
+    pub width: PhysicalQuantity,
+    pub height: PhysicalQuantity,
+    pub side: BoardSide,
+}
+
+impl Placement {
+    /// Domain invariant: the courtyard has positive extent — a zero-area footprint cannot be
+    /// checked for overlap or fit. Extents are compared via `si_magnitude()` (P9).
+    pub fn validate(&self) -> Result<(), DomainError> {
+        if !self.width.si_magnitude().is_finite()
+            || !self.height.si_magnitude().is_finite()
+            || self.width.si_magnitude() <= 0.0
+            || self.height.si_magnitude() <= 0.0
+        {
+            return Err(DomainError::Inconsistent(
+                "placement courtyard must be positive and finite",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// A violated domain invariant.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DomainError {
@@ -709,6 +792,113 @@ mod tests {
             manufacturer: "Texas Instruments".into(),
             lifecycle: PartLifecycle::Eol,
             datasheet: "https://ti.com/lm1117".into(),
+        };
+        assert!(p.validate().is_ok());
+    }
+
+    fn mm(v: f64) -> PhysicalQuantity {
+        PhysicalQuantity::new(v, eak_units::Unit::Millimetre)
+    }
+
+    #[test]
+    fn board_rejects_non_positive_dimensions() {
+        let zero_width = Board {
+            id: EntityId(1),
+            width: mm(0.0),
+            height: mm(50.0),
+            layers: 2,
+        };
+        assert_eq!(
+            zero_width.validate(),
+            Err(DomainError::Inconsistent(
+                "board dimensions must be positive and finite"
+            ))
+        );
+        let negative_height = Board {
+            id: EntityId(1),
+            width: mm(50.0),
+            height: mm(-1.0),
+            layers: 2,
+        };
+        assert_eq!(
+            negative_height.validate(),
+            Err(DomainError::Inconsistent(
+                "board dimensions must be positive and finite"
+            ))
+        );
+    }
+
+    #[test]
+    fn board_rejects_zero_layers() {
+        let b = Board {
+            id: EntityId(1),
+            width: mm(50.0),
+            height: mm(50.0),
+            layers: 0,
+        };
+        assert_eq!(
+            b.validate(),
+            Err(DomainError::Inconsistent(
+                "board must have at least one layer"
+            ))
+        );
+    }
+
+    #[test]
+    fn well_formed_board_validates() {
+        let b = Board {
+            id: EntityId(1),
+            width: mm(50.0),
+            height: mm(40.0),
+            layers: 2,
+        };
+        assert!(b.validate().is_ok());
+    }
+
+    #[test]
+    fn placement_rejects_non_positive_courtyard() {
+        let zero_width = Placement {
+            id: EntityId(1),
+            component: EntityId(2),
+            x: mm(1.0),
+            y: mm(1.0),
+            width: mm(0.0),
+            height: mm(5.0),
+            side: BoardSide::Top,
+        };
+        assert_eq!(
+            zero_width.validate(),
+            Err(DomainError::Inconsistent(
+                "placement courtyard must be positive and finite"
+            ))
+        );
+        let negative_height = Placement {
+            id: EntityId(1),
+            component: EntityId(2),
+            x: mm(1.0),
+            y: mm(1.0),
+            width: mm(5.0),
+            height: mm(-2.0),
+            side: BoardSide::Bottom,
+        };
+        assert_eq!(
+            negative_height.validate(),
+            Err(DomainError::Inconsistent(
+                "placement courtyard must be positive and finite"
+            ))
+        );
+    }
+
+    #[test]
+    fn well_formed_placement_validates() {
+        let p = Placement {
+            id: EntityId(1),
+            component: EntityId(2),
+            x: mm(10.0),
+            y: mm(10.0),
+            width: mm(5.0),
+            height: mm(5.0),
+            side: BoardSide::Top,
         };
         assert!(p.validate().is_ok());
     }

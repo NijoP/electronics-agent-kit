@@ -9,8 +9,8 @@ use crate::clock::{Clock, IdSource};
 use crate::protocol::{AgentContext, Autonomy, CapabilityAck, CapabilityError, CapabilityRequest};
 use crate::state::EngineeringState;
 use eak_domain::{
-    BomLineItem, Component, Constraint, Decision, DesignIntent, EntityId, Evidence,
-    FunctionalBlock, Net, Part, Pin, ProvenanceLink, Requirement, Violation, Waiver,
+    Board, BomLineItem, Component, Constraint, Decision, DesignIntent, EntityId, Evidence,
+    FunctionalBlock, Net, Part, Pin, Placement, ProvenanceLink, Requirement, Violation, Waiver,
 };
 use eak_ports::{
     Event, EventLog, ReasoningEngine, ReasoningError, ReasoningRequest, ReasoningResponse, Seq,
@@ -383,6 +383,86 @@ impl RuntimeCore {
             .map_err(|e| CapabilityError::Rejected(e.to_string()))?;
         Ok(CapabilityAck { committed: seqs })
     }
+
+    fn handle_create_board(
+        &mut self,
+        board: Board,
+        links: Vec<ProvenanceLink>,
+    ) -> Result<CapabilityAck, CapabilityError> {
+        // The seam (P3): re-validate the outline (positive dimensions + at least one layer)
+        // before committing.
+        board
+            .validate()
+            .map_err(|e| CapabilityError::Rejected(e.to_string()))?;
+        // A design has exactly one outline; a second board would make placement DRC ambiguous
+        // (which board is being fit against?) — reject it (P5).
+        if self.state.board.is_some() {
+            return Err(CapabilityError::Rejected(
+                "design already has a board outline".into(),
+            ));
+        }
+
+        let mut events = vec![Event::BoardCommitted { board }];
+        for link in links {
+            events.push(Event::ProvenanceLinked { link });
+        }
+        let seqs = self
+            .commit(events)
+            .map_err(|e| CapabilityError::Rejected(e.to_string()))?;
+        Ok(CapabilityAck { committed: seqs })
+    }
+
+    fn handle_place_component(
+        &mut self,
+        placement: Placement,
+        links: Vec<ProvenanceLink>,
+    ) -> Result<CapabilityAck, CapabilityError> {
+        // The seam (P3): re-validate the courtyard (positive extent) before committing.
+        placement
+            .validate()
+            .map_err(|e| CapabilityError::Rejected(e.to_string()))?;
+        // A placement with no component is untraceable to the schematic (P3) — reject it.
+        if placement.component.is_null() {
+            return Err(CapabilityError::Rejected(
+                "placement has no component".into(),
+            ));
+        }
+        // Referential integrity at the seam: the placed component must be realized (P3, P5).
+        if self.state.component(placement.component).is_none() {
+            return Err(CapabilityError::Rejected(format!(
+                "placement references unknown component {}",
+                placement.component.short()
+            )));
+        }
+        // A placement is meaningless without an outline to fit against — require the board
+        // first, so layout can never precede the floor plan (P5).
+        if self.state.board.is_none() {
+            return Err(CapabilityError::Rejected(
+                "cannot place a component before the board outline exists".into(),
+            ));
+        }
+        // Single-placement: a component sits at exactly one spot on one side, so a second
+        // placement of the same component would contradict itself — reject it (P5).
+        if self
+            .state
+            .placements
+            .iter()
+            .any(|p| p.component == placement.component)
+        {
+            return Err(CapabilityError::Rejected(
+                "component is already placed".into(),
+            ));
+        }
+
+        let mut events = vec![Event::PlacementCommitted { placement }];
+        for link in links {
+            events.push(Event::ProvenanceLinked { link });
+        }
+        let seqs = self
+            .commit(events)
+            .map_err(|e| CapabilityError::Rejected(e.to_string()))?;
+        Ok(CapabilityAck { committed: seqs })
+    }
 }
 
 impl AgentContext for RuntimeCore {
@@ -438,6 +518,14 @@ impl AgentContext for RuntimeCore {
         self.state.bom_line_items.clone()
     }
 
+    fn board(&self) -> Option<Board> {
+        self.state.board.clone()
+    }
+
+    fn placements(&self) -> Vec<Placement> {
+        self.state.placements.clone()
+    }
+
     fn reason(
         &mut self,
         mut req: ReasoningRequest,
@@ -482,6 +570,12 @@ impl AgentContext for RuntimeCore {
             CapabilityRequest::CreatePart { part, links } => self.handle_create_part(part, links),
             CapabilityRequest::CreateBomLineItem { item, links } => {
                 self.handle_create_bom_line_item(item, links)
+            }
+            CapabilityRequest::CreateBoard { board, links } => {
+                self.handle_create_board(board, links)
+            }
+            CapabilityRequest::PlaceComponent { placement, links } => {
+                self.handle_place_component(placement, links)
             }
         }
     }

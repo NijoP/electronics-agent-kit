@@ -1,13 +1,16 @@
-//! End-to-end verification of the Phase-3 exit criteria over the full 8-phase workflow:
+//! End-to-end verification of the Phase-3 exit criteria over the full 11-phase workflow:
 //! Requirement Planning -> Engineering Analysis -> Constraint Extraction -> Constraint
-//! Verification -> Schematic Planning -> ERC Verification -> BOM Planning -> BOM Verification.
-//! A consistent, realizable design runs all eight phases clean and lands a sourced bill of
-//! materials. Three kinds of fault are each caught at their gate, routed back automatically,
-//! and left fully traceable to their cause: an infeasible constraint pair (Constraint
-//! Verification), an electrically-invalid power net with consumers but no driver (ERC), and a
-//! procurement fault — an end-of-life catalog part — at the BOM lifecycle gate. The Phase-1/2
-//! guarantees (multi-phase orchestration, full requirement traceability, the correctness
-//! loops, byte-identical replay) still hold over the larger workflow.
+//! Verification -> Schematic Planning -> ERC Verification -> BOM Planning -> BOM Verification
+//! -> PCB Floor Planning -> Component Placement -> DRC Verification. A consistent, realizable
+//! design runs all eleven phases clean and lands a placed board. Four kinds of fault are each
+//! caught at their gate, routed back automatically, and left fully traceable to their cause: an
+//! infeasible constraint pair (Constraint Verification), an electrically-invalid power net with
+//! consumers but no driver (ERC), a procurement fault — an end-of-life catalog part — at the
+//! BOM lifecycle gate, and a courtyard that runs off an undersized board outline (DRC). The
+//! first three faults stop the workflow before any of the PCB phases run; the DRC fault is the
+//! last gate. The Phase-1/2 guarantees (multi-phase orchestration, full requirement
+//! traceability, the correctness loops, byte-identical replay) still hold over the larger
+//! workflow.
 
 use eak_cli::{
     replay_cmd, run, run_with, trace_cmd, PhaseOutcome, ReasoningChoice, Relation, RunConfig,
@@ -139,15 +142,67 @@ fn regulator_and_load_engine() -> Box<dyn ReasoningEngine> {
     }))
 }
 
+/// A reasoning engine for the PCB oversize-board scenario: a USB-C power-entry connector
+/// (Functional, recognized as a power source -> a 9 mm courtyard), an enclosure limit that
+/// sizes the board (Mechanical, carrying the only length target), and one electrical load
+/// (-> a 6 mm IC). The three blocks are realized into three components which Component Placement
+/// lays out left-to-right at x = 2, 14, 26 mm (a 2 mm margin and a 12 mm pitch).
+///
+/// The enclosure target is 24 mm, not the very tightest conceivable outline, by deliberate
+/// arithmetic: with a 12 mm placement pitch the third component sits at x = 26 mm and needs a
+/// 32 mm-wide board to fit, so any square outline in (20, 32) mm leaves EXACTLY that one
+/// component off the board while the first two fit — giving a single, unambiguous
+/// `drc-out-of-bounds` violation to trace. (An 8 x 8 mm outline would instead push all three
+/// components off the board and raise three separate violations — see
+/// `drc_oversize_board_is_caught_routed_back_and_left_traceable`.)
+fn oversize_board_engine() -> Box<dyn ReasoningEngine> {
+    let usb_c = CandidateRequirement {
+        statement: "Device shall be powered over USB-C".into(),
+        category: RequirementCategory::Functional,
+        priority: Priority::High,
+        acceptance_criterion: "the device enumerates and draws power through a USB-C receptacle"
+            .into(),
+        source_hint: "intent: USB-C power entry".into(),
+        confidence: 0.9,
+        rationale: "USB-C is the stated power interface".into(),
+        targets: vec![],
+    };
+    let enclosure = CandidateRequirement {
+        statement: "Enclosure limits the board to 24 x 24 mm".into(),
+        category: RequirementCategory::Mechanical,
+        priority: Priority::High,
+        acceptance_criterion: "the board outline fits within 24 x 24 mm".into(),
+        source_hint: "intent: enclosure".into(),
+        confidence: 0.9,
+        rationale: "the enclosure caps the usable board area".into(),
+        targets: vec![PhysicalQuantity::new(24.0, Unit::Millimetre)],
+    };
+    let load = CandidateRequirement {
+        statement: "Logic core shall operate at a 3.3 V logic level".into(),
+        category: RequirementCategory::Electrical,
+        priority: Priority::High,
+        acceptance_criterion: "core I/O is measured at a 3.3 V logic level".into(),
+        source_hint: "intent: logic core".into(),
+        confidence: 0.9,
+        rationale: "the digital core needs a defined logic level".into(),
+        targets: vec![],
+    };
+    Box::new(FixtureEngine::single(ReasoningResponse {
+        candidates: vec![usb_c, enclosure, load],
+        clarifying_questions: vec![],
+        raw: "{}".into(),
+    }))
+}
+
 #[test]
-fn run_replays_byte_identical_and_runs_eight_phases() {
+fn run_replays_byte_identical_and_runs_eleven_phases() {
     let (config, log) = cfg("det", 1);
     let report = run(&config).expect("run succeeds");
 
     // Full Phase-3 workflow on a consistent, realizable design: RP -> Engineering Analysis ->
     // Constraint Extraction -> Constraint Verification -> Schematic Planning -> ERC -> BOM
-    // Planning -> BOM Verification, all OK.
-    assert_eq!(report.outcomes.len(), 8);
+    // Planning -> BOM Verification -> PCB Floor Planning -> Component Placement -> DRC, all OK.
+    assert_eq!(report.outcomes.len(), 11);
     assert!(report
         .outcomes
         .iter()
@@ -166,6 +221,10 @@ fn run_replays_byte_identical_and_runs_eight_phases() {
     // The BOM layer landed: every component was sourced to a concrete part through a line item.
     assert!(!report.state.parts.is_empty());
     assert!(!report.state.bom_line_items.is_empty());
+
+    // The PCB layer landed: a board outline exists and every component was placed on it.
+    assert!(report.state.board.is_some());
+    assert!(!report.state.placements.is_empty());
 
     // EXIT CRITERION (Phase 1, preserved): history replays to identical state, byte for byte.
     let replayed = replay_cmd(&log).expect("replay succeeds");
@@ -206,6 +265,16 @@ fn infeasible_constraints_are_caught_routed_back_and_left_traceable() {
     assert!(report.state.components.is_empty());
     assert!(report.state.parts.is_empty());
     assert!(report.state.bom_line_items.is_empty());
+
+    // ... and certainly none of the PCB layer ran: no floor plan, no placement, no DRC.
+    assert!(!report.outcomes.iter().any(|(n, _)| n == "PcbFloorPlanning"));
+    assert!(!report
+        .outcomes
+        .iter()
+        .any(|(n, _)| n == "ComponentPlacement"));
+    assert!(!report.outcomes.iter().any(|(n, _)| n == "DrcVerification"));
+    assert!(report.state.board.is_none());
+    assert!(report.state.placements.is_empty());
 
     // Exactly one violation (re-verification did not duplicate it), still OPEN and blocking.
     assert_eq!(report.state.violations.len(), 1);
@@ -277,12 +346,20 @@ fn undriven_power_net_is_caught_routed_back_and_left_traceable() {
     // constraints, so nothing to contradict).
     assert!(report.state.constraints.is_empty());
 
-    // The workflow never progressed past the failed ERC gate — the BOM layer never ran, so no
-    // parts were sourced.
+    // The workflow never progressed past the failed ERC gate — neither the BOM layer nor any
+    // PCB phase ran, so no parts were sourced and no board was placed.
     assert!(!report.outcomes.iter().any(|(n, _)| n == "BomPlanning"));
     assert!(!report.outcomes.iter().any(|(n, _)| n == "BomVerification"));
+    assert!(!report.outcomes.iter().any(|(n, _)| n == "PcbFloorPlanning"));
+    assert!(!report
+        .outcomes
+        .iter()
+        .any(|(n, _)| n == "ComponentPlacement"));
+    assert!(!report.outcomes.iter().any(|(n, _)| n == "DrcVerification"));
     assert!(report.state.parts.is_empty());
     assert!(report.state.bom_line_items.is_empty());
+    assert!(report.state.board.is_none());
+    assert!(report.state.placements.is_empty());
 
     // The workflow did not reach a clean end: its final phase is the failed ERC gate.
     let (last_name, last_outcome) = report.outcomes.last().expect("at least one phase ran");
@@ -386,6 +463,17 @@ fn bom_eol_part_is_caught_routed_back_and_left_traceable() {
     assert!(!report.state.parts.is_empty());
     assert!(!report.state.bom_line_items.is_empty());
 
+    // The workflow never progressed past the failed BOM gate — none of the PCB phases ran, so
+    // no board was floor-planned and nothing was placed.
+    assert!(!report.outcomes.iter().any(|(n, _)| n == "PcbFloorPlanning"));
+    assert!(!report
+        .outcomes
+        .iter()
+        .any(|(n, _)| n == "ComponentPlacement"));
+    assert!(!report.outcomes.iter().any(|(n, _)| n == "DrcVerification"));
+    assert!(report.state.board.is_none());
+    assert!(report.state.placements.is_empty());
+
     // Exactly one violation (loop-back re-verification did not duplicate it): an end-of-life
     // part, OPEN + Error + blocking, raised by the BOM lifecycle rule.
     assert_eq!(report.state.violations.len(), 1);
@@ -447,6 +535,122 @@ fn bom_eol_part_is_caught_routed_back_and_left_traceable() {
 }
 
 #[test]
+fn drc_oversize_board_is_caught_routed_back_and_left_traceable() {
+    let (config, log) = cfg("drc", 11);
+    let report = run_with(oversize_board_engine(), &config).expect("run completes with a failure");
+
+    // The PCB correctness loop fired: DRC failed and was routed back to Component Placement,
+    // bounded to 1 initial + 2 retries = 3 DRC runs, every one failing.
+    let drc_runs: Vec<&PhaseOutcome> = report
+        .outcomes
+        .iter()
+        .filter(|(n, _)| n == "DrcVerification")
+        .map(|(_, o)| o)
+        .collect();
+    assert_eq!(drc_runs.len(), 3);
+    assert!(drc_runs
+        .iter()
+        .all(|o| matches!(o, PhaseOutcome::Failed(_))));
+
+    // The realization, BOM, and floor-planning layers ran clean upstream, so the substrate the
+    // DRC is checked against exists: a board outline and one placement per component.
+    assert!(report.state.board.is_some());
+    assert_eq!(report.state.placements.len(), 3);
+
+    // The workflow did not reach a clean end: its final phase is the failed DRC gate.
+    let (last_name, last_outcome) = report.outcomes.last().expect("at least one phase ran");
+    assert_eq!(last_name, "DrcVerification");
+    assert!(matches!(last_outcome, PhaseOutcome::Failed(_)));
+
+    // Exactly one OPEN, blocking, error-severity violation from the out-of-bounds rule
+    // (loop-back re-verification never double-raised it): the lone off-board courtyard. With
+    // the first two courtyards inside the 24 mm outline and the third (at x = 26 mm) off it,
+    // this is the single violation the scenario is built to produce.
+    let out_of_bounds: Vec<_> = report
+        .state
+        .violations
+        .iter()
+        .filter(|v| v.rule == "drc-out-of-bounds")
+        .collect();
+    assert_eq!(out_of_bounds.len(), 1);
+    let v = out_of_bounds[0];
+    assert_eq!(v.status, ViolationStatus::Open);
+    assert_eq!(v.severity, ViolationSeverity::Error);
+    assert!(v.is_blocking());
+    assert_eq!(
+        report.state.open_blocking_violations().len(),
+        1,
+        "the off-board courtyard is the only blocking violation"
+    );
+
+    // FULLY TRACEABLE across the PCB layer: the violation names a placement; walk
+    // placement -> component -> functional block -> requirement -> design intent, checking the
+    // backing provenance link at each synthesized hop.
+    let intent = report.state.intent.as_ref().expect("intent captured");
+    assert_eq!(v.subjects.len(), 1, "one off-board placement implicated");
+    let pid = v.subjects[0];
+
+    // Violation -> Placement (TracesTo), raised by DRC.
+    assert!(report
+        .state
+        .links
+        .iter()
+        .any(|l| l.from == v.id && l.to == pid && l.relation == Relation::TracesTo));
+
+    let placement = report
+        .state
+        .placement(pid)
+        .expect("violation subject is a known placement");
+    let component = report
+        .state
+        .component(placement.component)
+        .expect("placement positions a known component");
+
+    // Placement -> Component (TracesTo), recorded by Component Placement.
+    assert!(report
+        .state
+        .links
+        .iter()
+        .any(|l| l.from == pid && l.to == component.id && l.relation == Relation::TracesTo));
+
+    let block = report
+        .state
+        .functional_block(component.from_block)
+        .expect("component was realized from a known block");
+
+    // Component -> Block (DerivedFrom), recorded by Schematic Planning.
+    assert!(report.state.links.iter().any(|l| l.from == component.id
+        && l.to == block.id
+        && l.relation == Relation::DerivedFrom));
+
+    // Block -> Requirement (DerivedFrom), recorded by Engineering Analysis, and the requirement
+    // is rooted in the captured design intent.
+    assert!(
+        !block.requirements.is_empty(),
+        "block realizes a requirement"
+    );
+    for req_id in &block.requirements {
+        let req = report
+            .state
+            .requirement(*req_id)
+            .expect("block realizes a known requirement");
+        assert_eq!(req.source, intent.id);
+        assert!(report
+            .state
+            .links
+            .iter()
+            .any(|l| l.from == block.id && l.to == req.id && l.relation == Relation::DerivedFrom));
+    }
+
+    // Replay identity holds even for a failed, looped-back DRC run.
+    let replayed = replay_cmd(&log).expect("replay succeeds");
+    assert_eq!(report.state, replayed);
+    assert_eq!(report.state.canonical_json(), replayed.canonical_json());
+
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
 fn every_requirement_is_fully_traceable() {
     let (config, log) = cfg("trace", 2);
     let report = run(&config).expect("run succeeds");
@@ -483,7 +687,7 @@ fn two_runs_with_same_seed_are_identical() {
     let (c2, l2) = cfg("rep2", 7);
     let r1 = run(&c1).expect("run 1");
     let r2 = run(&c2).expect("run 2");
-    // determinism of the run itself (seeded ids + logical clock) across the 8-phase workflow.
+    // determinism of the run itself (seeded ids + logical clock) across the 11-phase workflow.
     assert_eq!(r1.state, r2.state);
     let _ = std::fs::remove_file(&l1);
     let _ = std::fs::remove_file(&l2);

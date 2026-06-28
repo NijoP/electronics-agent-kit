@@ -4,20 +4,26 @@
 pub mod agent;
 pub mod bom_planning;
 pub mod bom_verification;
+pub mod component_placement;
 pub mod constraint_extraction;
 pub mod constraint_verification;
+pub mod drc_verification;
 pub mod engineering_analysis;
 pub mod erc_verification;
+pub mod pcb_floor_planning;
 pub mod requirement_planning;
 pub mod schematic_planning;
 
 pub use agent::RequirementAgent;
 pub use bom_planning::BomPlanningMachine;
 pub use bom_verification::BomVerificationMachine;
+pub use component_placement::ComponentPlacementMachine;
 pub use constraint_extraction::ConstraintExtractionMachine;
 pub use constraint_verification::ConstraintVerificationMachine;
+pub use drc_verification::DrcVerificationMachine;
 pub use engineering_analysis::EngineeringAnalysisMachine;
 pub use erc_verification::ErcVerificationMachine;
+pub use pcb_floor_planning::PcbFloorPlanningMachine;
 pub use requirement_planning::RequirementPlanningMachine;
 pub use schematic_planning::SchematicPlanningMachine;
 
@@ -613,6 +619,177 @@ mod tests {
         // violation is raised and nothing blocks — the phase now passes.
         let mut verify = BomVerificationMachine::new();
         let outcome = ExecutionEngine::new().run(&mut verify, &mut core);
+        assert_eq!(outcome, PhaseOutcome::Success);
+        assert_eq!(core.state.violations.len(), 1); // no duplicate raised
+        assert_eq!(core.state.waivers.len(), 1);
+
+        // replay identity holds across the run + waive + re-verify.
+        let replayed = replay(core.log()).unwrap();
+        assert_eq!(core.state, replayed);
+    }
+
+    #[test]
+    fn happy_end_to_end_lays_out_clean_pcb() {
+        let mut core = RuntimeCore::new(
+            Box::new(MemLog { records: vec![] }),
+            Box::new(SourcedReasoner),
+            Box::new(SeededIdSource::new(7)),
+            Box::new(LogicalClock::new()),
+            Autonomy::Autonomous,
+        );
+        core.capture_intent("USB-C powered sensor node, < 5 W", "engineer")
+            .unwrap();
+
+        // The full 11-phase chain, run linearly (each phase succeeds, so no loop-back fires).
+        let mut plan = WorkflowPlan::new(vec![
+            Box::new(RequirementPlanningMachine::new()),
+            Box::new(EngineeringAnalysisMachine::new()),
+            Box::new(ConstraintExtractionMachine::new()),
+            Box::new(ConstraintVerificationMachine::new()),
+            Box::new(SchematicPlanningMachine::new()),
+            Box::new(ErcVerificationMachine::new()),
+            Box::new(BomPlanningMachine::new()),
+            Box::new(BomVerificationMachine::new()),
+            Box::new(PcbFloorPlanningMachine::new()),
+            Box::new(ComponentPlacementMachine::new()),
+            Box::new(DrcVerificationMachine::new()),
+        ]);
+        let results = Orchestrator::new().run(&mut plan, &mut core);
+
+        assert_eq!(results.len(), 11);
+        assert!(results.iter().all(|(_, o)| *o == PhaseOutcome::Success));
+        // The PCB layer exists: an outline plus one placement per realized component, all
+        // within bounds and non-overlapping, so the DRC is clean.
+        assert!(core.state.board.is_some());
+        assert!(!core.state.placements.is_empty());
+        assert_eq!(core.state.placements.len(), core.state.components.len());
+        assert!(core.state.violations.is_empty());
+
+        // byte-identical replay holds across the whole 11-phase run.
+        let replayed = replay(core.log()).unwrap();
+        assert_eq!(core.state, replayed);
+        assert_eq!(core.state.canonical_json(), replayed.canonical_json());
+    }
+
+    /// A reasoner that yields a USB-C connector (the ERC power source), a tight mechanical
+    /// board-size limit, and a downstream load. The connector drives the load's rail so the ERC
+    /// is clean and both catalog parts are Active so the BOM is clean — but the outline is too
+    /// small to fit the whole component row, so the last courtyard runs off the board edge and
+    /// DRC flags exactly one out-of-bounds placement.
+    struct OversizeReasoner;
+    impl ReasoningEngine for OversizeReasoner {
+        fn model_id(&self) -> String {
+            "oversize".into()
+        }
+        fn request_judgement(
+            &self,
+            _req: &ReasoningRequest,
+        ) -> Result<ReasoningResponse, ReasoningError> {
+            use eak_units::{PhysicalQuantity, Unit};
+            Ok(ReasoningResponse {
+                candidates: vec![
+                    CandidateRequirement {
+                        statement: "USB-C connector shall supply 5 V to the board".into(),
+                        category: RequirementCategory::Functional,
+                        priority: Priority::High,
+                        acceptance_criterion: "VBUS present at 5 V".into(),
+                        source_hint: "intent: USB-C power entry".into(),
+                        confidence: 0.9,
+                        rationale: "power entry".into(),
+                        targets: vec![],
+                    },
+                    // The first length-dimensioned target sizes the (square) outline. 24 mm is
+                    // wide enough for the connector + first load but not the whole 12 mm-pitch
+                    // row, so the trailing courtyard overhangs the edge.
+                    CandidateRequirement {
+                        statement: "Enclosure limits the board to a 24 mm square outline".into(),
+                        category: RequirementCategory::Mechanical,
+                        priority: Priority::High,
+                        acceptance_criterion: "outline <= 24 mm on each side".into(),
+                        source_hint: "intent: enclosure size".into(),
+                        confidence: 0.9,
+                        rationale: "mechanical envelope".into(),
+                        targets: vec![PhysicalQuantity::new(24.0, Unit::Millimetre)],
+                    },
+                    CandidateRequirement {
+                        statement: "Microcontroller shall run the sensing firmware".into(),
+                        category: RequirementCategory::Electrical,
+                        priority: Priority::High,
+                        acceptance_criterion: "firmware boots and samples".into(),
+                        source_hint: "intent: sensing load".into(),
+                        confidence: 0.9,
+                        rationale: "compute load".into(),
+                        targets: vec![],
+                    },
+                ],
+                clarifying_questions: vec![],
+                raw: "{}".into(),
+            })
+        }
+    }
+
+    #[test]
+    fn drc_oversize_waiver_lets_reverification_pass() {
+        let mut core = RuntimeCore::new(
+            Box::new(MemLog { records: vec![] }),
+            Box::new(OversizeReasoner),
+            Box::new(SeededIdSource::new(7)),
+            Box::new(LogicalClock::new()),
+            Autonomy::Autonomous,
+        );
+        core.capture_intent("USB-C sensor node in a tight enclosure", "engineer")
+            .unwrap();
+
+        // Run the full 11-phase chain linearly. ERC and BOM are clean (a driven rail, Active
+        // parts), but the outline is too small for the whole component row, so DRC fails with
+        // one out-of-bounds courtyard and the linear plan stops there.
+        let mut plan = WorkflowPlan::new(vec![
+            Box::new(RequirementPlanningMachine::new()),
+            Box::new(EngineeringAnalysisMachine::new()),
+            Box::new(ConstraintExtractionMachine::new()),
+            Box::new(ConstraintVerificationMachine::new()),
+            Box::new(SchematicPlanningMachine::new()),
+            Box::new(ErcVerificationMachine::new()),
+            Box::new(BomPlanningMachine::new()),
+            Box::new(BomVerificationMachine::new()),
+            Box::new(PcbFloorPlanningMachine::new()),
+            Box::new(ComponentPlacementMachine::new()),
+            Box::new(DrcVerificationMachine::new()),
+        ]);
+        let results = Orchestrator::new().run(&mut plan, &mut core);
+        assert_eq!(results.len(), 11);
+
+        // ERC (index 5) and BOM Verification (index 7) both passed.
+        assert_eq!(results[5].1, PhaseOutcome::Success);
+        assert_eq!(results[7].1, PhaseOutcome::Success);
+        // The final phase (DRC Verification) failed.
+        assert_eq!(results.last().unwrap().0, "DrcVerification");
+        assert!(matches!(results.last().unwrap().1, PhaseOutcome::Failed(_)));
+
+        // Exactly one open, blocking violation: the courtyard off the board edge.
+        assert_eq!(core.state.violations.len(), 1);
+        assert!(core.state.violations[0].is_blocking());
+        assert_eq!(core.state.violations[0].rule, "drc-out-of-bounds");
+
+        // Accept the violation via the only write path — the Capability port (P2).
+        let vid = core.state.violations[0].id;
+        let wid = core.fresh_id();
+        core.invoke(CapabilityRequest::GrantWaiver {
+            waiver: Waiver {
+                id: wid,
+                violation: vid,
+                justification: "courtyard overhang accepted for prototype bring-up".into(),
+                decided_by: "engineer".into(),
+            },
+        })
+        .expect("waiver granted");
+        assert_eq!(core.state.violations[0].status, ViolationStatus::Waived);
+        assert!(!core.state.violations[0].is_blocking());
+
+        // Re-verify DRC: the overhang is still found, but the violation is waived, so no new
+        // violation is raised and nothing blocks — the phase now passes.
+        let mut drc = DrcVerificationMachine::new();
+        let outcome = ExecutionEngine::new().run(&mut drc, &mut core);
         assert_eq!(outcome, PhaseOutcome::Success);
         assert_eq!(core.state.violations.len(), 1); // no duplicate raised
         assert_eq!(core.state.waivers.len(), 1);

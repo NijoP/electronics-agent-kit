@@ -5,8 +5,8 @@
 //! [`SchematicIr`] projections (transformation P1) at the engineering and schematic seams.
 
 use eak_domain::{
-    BomLineItem, Component, Constraint, DesignIntent, EntityId, FunctionalBlock, Net, Part, Pin,
-    ProvenanceLink, Requirement, RequirementStatus,
+    Board, BomLineItem, Component, Constraint, DesignIntent, EntityId, FunctionalBlock, Net, Part,
+    Pin, Placement, ProvenanceLink, Requirement, RequirementStatus,
 };
 use serde::{Deserialize, Serialize};
 
@@ -14,6 +14,7 @@ pub const REQUIREMENT_IR_SCHEMA_VERSION: u32 = 1;
 pub const ENGINEERING_IR_SCHEMA_VERSION: u32 = 1;
 pub const SCHEMATIC_IR_SCHEMA_VERSION: u32 = 1;
 pub const BOM_IR_SCHEMA_VERSION: u32 = 1;
+pub const PCB_IR_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IrError {
@@ -25,6 +26,9 @@ pub enum IrError {
     UnknownPart(EntityId),
     LineItemUnknownComponent(EntityId),
     UncoveredComponent(EntityId),
+    NoBoard,
+    PlacementUnknownComponent(EntityId),
+    UnplacedComponent(EntityId),
 }
 impl std::fmt::Display for IrError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -66,6 +70,19 @@ impl std::fmt::Display for IrError {
                 write!(
                     f,
                     "schematic component {} is not covered by any bom line item",
+                    id.short()
+                )
+            }
+            IrError::NoBoard => {
+                write!(f, "pcb layout requires a board outline but none exists")
+            }
+            IrError::PlacementUnknownComponent(id) => {
+                write!(f, "placement binds unknown component {}", id.short())
+            }
+            IrError::UnplacedComponent(id) => {
+                write!(
+                    f,
+                    "schematic component {} is not placed on the board",
                     id.short()
                 )
             }
@@ -255,12 +272,65 @@ impl BomIr {
     }
 }
 
+/// The fifth IR: the PCB layout at the boundary out of Component Placement — the physical
+/// [`Board`] outline, the [`Placement`]s binding schematic [`Component`]s to positions, and
+/// the components they place. A projection of canonical state (P6); never a rival source of
+/// truth. Physical values stay typed [`PhysicalQuantity`]s, so DRC downstream is unambiguous.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PcbIr {
+    pub schema_version: u32,
+    pub schematic_ir_schema_version: u32,
+    pub board: Board,
+    pub placements: Vec<Placement>,
+    pub components: Vec<Component>,
+}
+
+impl PcbIr {
+    /// Project canonical state into the PCB IR (transformation P1), enforcing layout
+    /// integrity: a board outline exists (else [`IrError::NoBoard`]); every placement binds a
+    /// component that exists upstream in the schematic (P3); and every schematic component is
+    /// placed — nothing reaches manufacturing unplaced (P13).
+    pub fn project(
+        schematic: &SchematicIr,
+        board: Option<&Board>,
+        placements: &[Placement],
+    ) -> Result<Self, IrError> {
+        // invariant: a board outline must precede any layout (P3).
+        let board = board.ok_or(IrError::NoBoard)?;
+        for placement in placements {
+            // invariant: every placement binds a real schematic component (P3).
+            if !schematic
+                .components
+                .iter()
+                .any(|c| c.id == placement.component)
+            {
+                return Err(IrError::PlacementUnknownComponent(placement.component));
+            }
+        }
+        // invariant: every schematic component is placed on the board (P13).
+        for c in &schematic.components {
+            if !placements.iter().any(|p| p.component == c.id) {
+                return Err(IrError::UnplacedComponent(c.id));
+            }
+        }
+        Ok(Self {
+            schema_version: PCB_IR_SCHEMA_VERSION,
+            schematic_ir_schema_version: schematic.schema_version,
+            board: board.clone(),
+            placements: placements.to_vec(),
+            components: schematic.components.clone(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use eak_domain::{
-        ComponentClass, NetClass, PartLifecycle, PinElectricalType, Priority, RequirementCategory,
+        BoardSide, ComponentClass, NetClass, PartLifecycle, PinElectricalType, Priority,
+        RequirementCategory,
     };
+    use eak_units::{PhysicalQuantity, Unit};
 
     fn intent() -> DesignIntent {
         DesignIntent {
@@ -468,6 +538,73 @@ mod tests {
         assert!(matches!(
             BomIr::project(&sch, &[], &[]),
             Err(IrError::UncoveredComponent(_))
+        ));
+    }
+
+    fn qty(mm: f64) -> PhysicalQuantity {
+        PhysicalQuantity::new(mm, Unit::Millimetre)
+    }
+    fn board(id: u128) -> Board {
+        Board {
+            id: EntityId(id),
+            width: qty(100.0),
+            height: qty(80.0),
+            layers: 2,
+        }
+    }
+    fn placement(id: u128, component: EntityId) -> Placement {
+        Placement {
+            id: EntityId(id),
+            component,
+            x: qty(10.0),
+            y: qty(10.0),
+            width: qty(5.0),
+            height: qty(5.0),
+            side: BoardSide::Top,
+        }
+    }
+
+    #[test]
+    fn pcb_project_links_board_and_placements() {
+        let sch = schematic_ir();
+        let b = board(80);
+        let pl = placement(70, EntityId(20));
+        let pcb = PcbIr::project(&sch, Some(&b), &[pl]).unwrap();
+        assert_eq!(pcb.schema_version, PCB_IR_SCHEMA_VERSION);
+        assert_eq!(pcb.schematic_ir_schema_version, sch.schema_version);
+        assert_eq!(pcb.board.id, EntityId(80));
+        assert_eq!(pcb.placements.len(), 1);
+        assert_eq!(pcb.placements[0].component, EntityId(20));
+        assert_eq!(pcb.components.len(), 1);
+    }
+
+    #[test]
+    fn pcb_project_rejects_no_board() {
+        let sch = schematic_ir();
+        // a layout without a board outline cannot be projected.
+        assert!(matches!(
+            PcbIr::project(&sch, None, &[placement(70, EntityId(20))]),
+            Err(IrError::NoBoard)
+        ));
+    }
+
+    #[test]
+    fn pcb_project_rejects_placement_unknown_component() {
+        let sch = schematic_ir();
+        // placement binds a component (99) that is not in the schematic.
+        assert!(matches!(
+            PcbIr::project(&sch, Some(&board(80)), &[placement(70, EntityId(99))]),
+            Err(IrError::PlacementUnknownComponent(_))
+        ));
+    }
+
+    #[test]
+    fn pcb_project_rejects_unplaced_component() {
+        let sch = schematic_ir();
+        // schematic component 20 is never placed on the board.
+        assert!(matches!(
+            PcbIr::project(&sch, Some(&board(80)), &[]),
+            Err(IrError::UnplacedComponent(_))
         ));
     }
 }

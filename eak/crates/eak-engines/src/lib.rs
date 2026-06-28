@@ -6,8 +6,9 @@
 //! See `docs/engineering/constraint-engine.md` and `docs/engineering/verification-engine.md`.
 
 use eak_domain::{
-    BomLineItem, Component, ComponentClass, Constraint, ConstraintKind, EntityId, Net, NetClass,
-    Part, PartLifecycle, Pin, PinElectricalType, Requirement, ViolationSeverity,
+    Board, BomLineItem, Component, ComponentClass, Constraint, ConstraintKind, EntityId, Net,
+    NetClass, Part, PartLifecycle, Pin, PinElectricalType, Placement, Requirement,
+    ViolationSeverity,
 };
 use eak_units::{PhysicalQuantity, UnitError};
 use std::cmp::Ordering;
@@ -96,8 +97,11 @@ fn feasible_interval(c: &Constraint) -> (f64, f64) {
 
 /// The read-only inputs a [`Rule`] evaluates against — a snapshot of the design's
 /// machine-checkable layer. Additive in Phase 3: the schematic layer (components, pins,
-/// nets) so ERC rules can reason over connectivity, and the BOM layer (parts, line items)
-/// so BOM rules can reason over coverage and lifecycle (P9).
+/// nets) so ERC rules can reason over connectivity, the BOM layer (parts, line items) so
+/// BOM rules can reason over coverage and lifecycle, and the PCB layer (`board`, `placements`)
+/// so DRC rules can reason over physical fit and courtyard collisions (P9). `board` is
+/// `Option` because DRC runs only once an outline exists; when absent, geometry rules emit
+/// no findings rather than guessing a substrate.
 pub struct VerificationContext<'a> {
     pub requirements: &'a [Requirement],
     pub constraints: &'a [Constraint],
@@ -106,6 +110,8 @@ pub struct VerificationContext<'a> {
     pub nets: &'a [Net],
     pub parts: &'a [Part],
     pub bom_line_items: &'a [BomLineItem],
+    pub board: Option<&'a Board>,
+    pub placements: &'a [Placement],
 }
 
 /// A problem a rule detected. Not yet a domain `Violation` — the runtime mints that at the
@@ -491,10 +497,125 @@ impl Rule for BomLifecycleRule {
     }
 }
 
+// ================================== DRC Rules ==================================
+
+/// DRC rule: every [`Placement`]'s courtyard must lie wholly within the [`Board`] outline.
+/// The courtyard spans `[x, x + width] x [y, y + height]`; it is out of bounds when any edge
+/// crosses the origin or the board's far edge. Comparisons are on the SI axis via
+/// `si_magnitude()` so the check is unit-independent (P9). With no board there is no outline
+/// to fit within, so the rule emits nothing. Placements are scanned in slice order for
+/// determinism.
+pub struct DrcOutOfBoundsRule;
+
+impl DrcOutOfBoundsRule {
+    pub const ID: &'static str = "drc-out-of-bounds";
+
+    pub fn new() -> Self {
+        Self
+    }
+}
+impl Default for DrcOutOfBoundsRule {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Rule for DrcOutOfBoundsRule {
+    fn id(&self) -> &str {
+        Self::ID
+    }
+
+    fn evaluate(&self, ctx: &VerificationContext) -> Vec<ViolationFinding> {
+        let Some(board) = ctx.board else {
+            return Vec::new();
+        };
+        let (board_w, board_h) = (board.width.si_magnitude(), board.height.si_magnitude());
+        let mut findings = Vec::new();
+        for placement in ctx.placements.iter() {
+            let x = placement.x.si_magnitude();
+            let y = placement.y.si_magnitude();
+            let w = placement.width.si_magnitude();
+            let h = placement.height.si_magnitude();
+            if x < 0.0 || y < 0.0 || x + w > board_w || y + h > board_h {
+                findings.push(ViolationFinding {
+                    rule: Self::ID.to_string(),
+                    severity: ViolationSeverity::Error,
+                    subjects: vec![placement.id],
+                    message: format!(
+                        "placement {} extends outside the board outline",
+                        placement.id.short()
+                    ),
+                });
+            }
+        }
+        findings
+    }
+}
+
+/// DRC rule: no two courtyards on the same [`BoardSide`] may overlap — components on opposite
+/// copper sides never collide, so only same-side pairs are tested. Overlap is a standard AABB
+/// intersection on the SI axis (P9), using strict `<` (open-set): courtyards that merely *touch*
+/// edge-to-edge (zero clearance) are NOT flagged here — minimum-clearance enforcement is a
+/// separate future rule. Pairs are scanned `i < j` in slice order and each finding's subjects
+/// are sorted, so output is deterministic regardless of placement order.
+pub struct DrcCourtyardOverlapRule;
+
+impl DrcCourtyardOverlapRule {
+    pub const ID: &'static str = "drc-courtyard-overlap";
+
+    pub fn new() -> Self {
+        Self
+    }
+}
+impl Default for DrcCourtyardOverlapRule {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Rule for DrcCourtyardOverlapRule {
+    fn id(&self) -> &str {
+        Self::ID
+    }
+
+    fn evaluate(&self, ctx: &VerificationContext) -> Vec<ViolationFinding> {
+        let mut findings = Vec::new();
+        let placements = ctx.placements;
+        for i in 0..placements.len() {
+            for j in (i + 1)..placements.len() {
+                let (a, b) = (&placements[i], &placements[j]);
+                if a.side != b.side {
+                    continue;
+                }
+                let (ax, ay) = (a.x.si_magnitude(), a.y.si_magnitude());
+                let (aw, ah) = (a.width.si_magnitude(), a.height.si_magnitude());
+                let (bx, by) = (b.x.si_magnitude(), b.y.si_magnitude());
+                let (bw, bh) = (b.width.si_magnitude(), b.height.si_magnitude());
+                let overlaps = ax < bx + bw && bx < ax + aw && ay < by + bh && by < ay + ah;
+                if overlaps {
+                    let mut subjects = vec![a.id, b.id];
+                    subjects.sort(); // stable dedup key regardless of pair order
+                    findings.push(ViolationFinding {
+                        rule: Self::ID.to_string(),
+                        severity: ViolationSeverity::Error,
+                        subjects,
+                        message: format!(
+                            "placements {} and {} have overlapping courtyards on the same side",
+                            a.id.short(),
+                            b.id.short()
+                        ),
+                    });
+                }
+            }
+        }
+        findings
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eak_domain::ConstraintStatus;
+    use eak_domain::{BoardSide, ConstraintStatus};
     use eak_units::Unit;
 
     #[test]
@@ -576,6 +697,8 @@ mod tests {
             nets: &[],
             parts: &[],
             bom_line_items: &[],
+            board: None,
+            placements: &[],
         };
         let findings = rule.evaluate(&ctx);
         assert_eq!(findings.len(), 1);
@@ -601,6 +724,8 @@ mod tests {
             nets: &[],
             parts: &[],
             bom_line_items: &[],
+            board: None,
+            placements: &[],
         });
         assert_eq!(findings.len(), 1);
     }
@@ -619,6 +744,8 @@ mod tests {
             nets: &[],
             parts: &[],
             bom_line_items: &[],
+            board: None,
+            placements: &[],
         });
         assert!(findings.is_empty());
     }
@@ -652,6 +779,8 @@ mod tests {
             nets,
             parts: &[],
             bom_line_items: &[],
+            board: None,
+            placements: &[],
         }
     }
 
@@ -754,6 +883,8 @@ mod tests {
             nets: &[],
             parts,
             bom_line_items,
+            board: None,
+            placements: &[],
         }
     }
 
@@ -819,5 +950,129 @@ mod tests {
         let findings = BomLifecycleRule::new().evaluate(&bom_ctx(&[], &parts, &items));
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].severity, ViolationSeverity::Warning);
+    }
+
+    // -------------------------------- DRC rule tests --------------------------------
+
+    fn mm(v: f64) -> PhysicalQuantity {
+        PhysicalQuantity::new(v, Unit::Millimetre)
+    }
+
+    fn board(id: u128, w: f64, h: f64) -> Board {
+        Board {
+            id: EntityId(id),
+            width: mm(w),
+            height: mm(h),
+            layers: 2,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn placement(
+        id: u128,
+        component: u128,
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+        side: BoardSide,
+    ) -> Placement {
+        Placement {
+            id: EntityId(id),
+            component: EntityId(component),
+            x: mm(x),
+            y: mm(y),
+            width: mm(w),
+            height: mm(h),
+            side,
+        }
+    }
+
+    fn drc_ctx<'a>(
+        board: Option<&'a Board>,
+        placements: &'a [Placement],
+    ) -> VerificationContext<'a> {
+        VerificationContext {
+            requirements: &[],
+            constraints: &[],
+            components: &[],
+            pins: &[],
+            nets: &[],
+            parts: &[],
+            bom_line_items: &[],
+            board,
+            placements,
+        }
+    }
+
+    #[test]
+    fn placement_inside_board_passes_drc() {
+        let b = board(1, 100.0, 80.0);
+        // Courtyard [10,30] x [10,30] sits comfortably inside the 100x80 outline.
+        let placements = vec![placement(10, 900, 10.0, 10.0, 20.0, 20.0, BoardSide::Top)];
+        assert!(DrcOutOfBoundsRule::new()
+            .evaluate(&drc_ctx(Some(&b), &placements))
+            .is_empty());
+    }
+
+    #[test]
+    fn placement_past_board_edge_is_out_of_bounds() {
+        let b = board(1, 100.0, 80.0);
+        // x + width = 90 + 20 = 110 > 100: the courtyard runs off the right edge.
+        let placements = vec![placement(10, 900, 90.0, 10.0, 20.0, 20.0, BoardSide::Top)];
+        let findings = DrcOutOfBoundsRule::new().evaluate(&drc_ctx(Some(&b), &placements));
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule, DrcOutOfBoundsRule::ID);
+        assert_eq!(findings[0].severity, ViolationSeverity::Error);
+        assert_eq!(findings[0].subjects, vec![EntityId(10)]);
+    }
+
+    #[test]
+    fn out_of_bounds_yields_no_findings_without_a_board() {
+        // No outline to fit within: the geometry rule stays silent rather than guessing.
+        let placements = vec![placement(10, 900, 90.0, 10.0, 20.0, 20.0, BoardSide::Top)];
+        assert!(DrcOutOfBoundsRule::new()
+            .evaluate(&drc_ctx(None, &placements))
+            .is_empty());
+    }
+
+    #[test]
+    fn overlapping_courtyards_on_same_side_are_flagged() {
+        let b = board(1, 100.0, 80.0);
+        // Two [.,.+20] courtyards offset by 10mm overlap; both on Top.
+        let placements = vec![
+            placement(20, 900, 10.0, 10.0, 20.0, 20.0, BoardSide::Top),
+            placement(10, 901, 20.0, 20.0, 20.0, 20.0, BoardSide::Top),
+        ];
+        let findings = DrcCourtyardOverlapRule::new().evaluate(&drc_ctx(Some(&b), &placements));
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule, DrcCourtyardOverlapRule::ID);
+        assert_eq!(findings[0].severity, ViolationSeverity::Error);
+        // Subjects sorted regardless of slice order (20 listed first, 10 second).
+        assert_eq!(findings[0].subjects, vec![EntityId(10), EntityId(20)]);
+    }
+
+    #[test]
+    fn overlapping_courtyards_on_opposite_sides_do_not_collide() {
+        let b = board(1, 100.0, 80.0);
+        // Same footprint, but one Top and one Bottom: opposite copper never collides.
+        let placements = vec![
+            placement(10, 900, 10.0, 10.0, 20.0, 20.0, BoardSide::Top),
+            placement(11, 901, 20.0, 20.0, 20.0, 20.0, BoardSide::Bottom),
+        ];
+        assert!(DrcCourtyardOverlapRule::new()
+            .evaluate(&drc_ctx(Some(&b), &placements))
+            .is_empty());
+    }
+
+    #[test]
+    fn courtyard_overlap_needs_no_board() {
+        // Overlap is purely pairwise geometry; it does not depend on the outline.
+        let placements = vec![
+            placement(10, 900, 0.0, 0.0, 20.0, 20.0, BoardSide::Top),
+            placement(11, 901, 5.0, 5.0, 20.0, 20.0, BoardSide::Top),
+        ];
+        let findings = DrcCourtyardOverlapRule::new().evaluate(&drc_ctx(None, &placements));
+        assert_eq!(findings.len(), 1);
     }
 }

@@ -5,9 +5,9 @@
 //! run and during [`crate::replay`], guaranteeing identical reconstruction.
 
 use eak_domain::{
-    BomLineItem, Component, Constraint, Decision, DesignIntent, EntityId, Evidence,
-    FunctionalBlock, Net, Part, Pin, ProvenanceLink, Requirement, Violation, ViolationStatus,
-    Waiver,
+    Board, BomLineItem, Component, Constraint, Decision, DesignIntent, EntityId, Evidence,
+    FunctionalBlock, Net, Part, Pin, Placement, ProvenanceLink, Requirement, Violation,
+    ViolationStatus, Waiver,
 };
 use eak_ports::Event;
 use serde::{Deserialize, Serialize};
@@ -33,6 +33,9 @@ pub struct EngineeringState {
     // Phase 3 (BOM): concrete parts and the line items binding them to components.
     pub parts: Vec<Part>,
     pub bom_line_items: Vec<BomLineItem>,
+    // Phase 3 (PCB): the single board outline plus each component's placement on it.
+    pub board: Option<Board>,
+    pub placements: Vec<Placement>,
 }
 
 impl EngineeringState {
@@ -71,6 +74,8 @@ impl EngineeringState {
             Event::NetCommitted { net } => self.nets.push(net.clone()),
             Event::PartCommitted { part } => self.parts.push(part.clone()),
             Event::BomLineItemCommitted { item } => self.bom_line_items.push(item.clone()),
+            Event::BoardCommitted { board } => self.board = Some(board.clone()),
+            Event::PlacementCommitted { placement } => self.placements.push(placement.clone()),
             // Audit-only events (phase lifecycle, reasoning calls, IR-boundary milestones)
             // carry no state and are intentionally not folded. AUDIT: any NEW state-bearing
             // event variant MUST get an explicit arm above, or replay will silently diverge.
@@ -120,6 +125,14 @@ impl EngineeringState {
 
     pub fn bom_line_item(&self, id: EntityId) -> Option<&BomLineItem> {
         self.bom_line_items.iter().find(|i| i.id == id)
+    }
+
+    pub fn board(&self) -> Option<&Board> {
+        self.board.as_ref()
+    }
+
+    pub fn placement(&self, id: EntityId) -> Option<&Placement> {
+        self.placements.iter().find(|p| p.id == id)
     }
 
     /// Open, blocking (error-severity) violations — the workflow gate (P13).

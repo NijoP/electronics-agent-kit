@@ -66,6 +66,11 @@ impl Machine for ErcVerificationMachine {
                 let nets = ctx.nets();
                 let parts = ctx.parts();
                 let bom_line_items = ctx.bom_line_items();
+                // The PCB layer is empty at this phase (the floor plan comes later); binding the
+                // owned board/placements to locals keeps the engine's context uniform across all
+                // verification phases.
+                let board = ctx.board();
+                let placements = ctx.placements();
                 let findings = engine.run(&VerificationContext {
                     requirements: &requirements,
                     constraints: &constraints,
@@ -74,6 +79,8 @@ impl Machine for ErcVerificationMachine {
                     nets: &nets,
                     parts: &parts,
                     bom_line_items: &bom_line_items,
+                    board: board.as_ref(),
+                    placements: &placements,
                 });
 
                 let existing = ctx.violations();
