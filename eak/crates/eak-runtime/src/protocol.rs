@@ -6,7 +6,8 @@
 
 use eak_domain::{
     Board, BomLineItem, Component, Constraint, Decision, DesignIntent, EntityId, Evidence,
-    FunctionalBlock, Net, Part, Pin, Placement, ProvenanceLink, Requirement, Violation, Waiver,
+    FunctionalBlock, Net, Part, Pin, Placement, ProvenanceLink, Requirement, Track, Violation,
+    Waiver,
 };
 use eak_ports::{Event, ReasoningError, ReasoningRequest, ReasoningResponse, Seq, StoreError};
 
@@ -112,6 +113,14 @@ pub enum CapabilityRequest {
         placement: Placement,
         links: Vec<ProvenanceLink>,
     },
+    /// Route one [`Net`] as a copper [`Track`], with its provenance links (Phase 3 routing).
+    /// The runtime re-validates the trace (positive width, finite endpoints), checks the net
+    /// exists, requires the board to exist first, and rejects a second track for the same net
+    /// at the seam — a net is realized by exactly one track.
+    RouteNet {
+        track: Track,
+        links: Vec<ProvenanceLink>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -159,6 +168,8 @@ pub trait AgentContext {
     fn board(&self) -> Option<Board>;
     /// Phase 3 (PCB): read the committed component placements (DRC + PCB IR input).
     fn placements(&self) -> Vec<Placement>;
+    /// Phase 3 (routing): read the committed tracks (DRC + PCB IR input).
+    fn tracks(&self) -> Vec<Track>;
     /// Call the reasoning engine, record the call (returning its event [`Seq`]), and
     /// return the judgement. Recording here is what makes replay deterministic (P4).
     fn reason(&mut self, req: ReasoningRequest)

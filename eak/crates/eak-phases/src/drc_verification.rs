@@ -2,19 +2,21 @@
 //!
 //! Structurally a sibling of [`ErcVerificationMachine`](crate::ErcVerificationMachine), but its
 //! [`VerificationEngine`] is loaded with the DRC rules ([`DrcOutOfBoundsRule`],
-//! [`DrcCourtyardOverlapRule`]) and it runs them over the physical layer (the board outline
-//! plus its placements). Each *new* finding becomes a first-class [`Violation`] linked back to
-//! the placement(s) it implicates so it is fully traceable to its cause (P3), and the
-//! [`Event::VerificationCompleted`] milestone is recorded. If any blocking (open,
-//! error-severity) violation remains — e.g. a courtyard off the board — it reports
-//! [`StepResult::Failed`], which the orchestrator routes back to Component Placement; otherwise
-//! the phase is [`StepResult::Done`]. Re-verification is idempotent — an already-raised
-//! violation (open OR waived) is never duplicated — so a waiver granted between passes lets the
-//! re-verify succeed. See `docs/state-machines/drc-verification.md`.
+//! [`DrcCourtyardOverlapRule`], [`DrcTraceWidthRule`]) and it runs them over the physical layer
+//! (the board outline, its placements, and the routed tracks). Each *new* finding becomes a
+//! first-class [`Violation`] linked back to the placement(s) or track(s) it implicates so it is
+//! fully traceable to its cause (P3), and the [`Event::VerificationCompleted`] milestone is
+//! recorded. If any blocking (open, error-severity) violation remains — e.g. a courtyard off the
+//! board or a trace finer than the process floor — it reports [`StepResult::Failed`], which the
+//! orchestrator routes back to Routing Planning; otherwise the phase is [`StepResult::Done`].
+//! Re-verification is idempotent — an already-raised violation (open OR waived) is never
+//! duplicated — so a waiver granted between passes lets the re-verify succeed. See
+//! `docs/state-machines/drc-verification.md`.
 
 use eak_domain::{ProvenanceLink, RelationType, Violation, ViolationStatus};
 use eak_engines::{
-    DrcCourtyardOverlapRule, DrcOutOfBoundsRule, VerificationContext, VerificationEngine,
+    DrcCourtyardOverlapRule, DrcOutOfBoundsRule, DrcTraceWidthRule, VerificationContext,
+    VerificationEngine,
 };
 use eak_ports::Event;
 use eak_runtime::{AgentContext, CapabilityRequest, Machine, MachineError, StepResult};
@@ -26,13 +28,15 @@ impl DrcVerificationMachine {
         Self
     }
 
-    /// The verification engine for this phase: the two Phase-3 DRC rules registered against the
-    /// same generic framework that Constraint, ERC, and BOM Verification use (reuse: one
-    /// framework, many checks).
+    /// The verification engine for this phase: the three Phase-3 DRC rules — two placement
+    /// geometry checks plus the routing trace-width check — registered against the same generic
+    /// framework that Constraint, ERC, and BOM Verification use (reuse: one framework, many
+    /// checks).
     fn engine() -> VerificationEngine {
         VerificationEngine::new()
             .with_rule(Box::new(DrcOutOfBoundsRule::new()))
             .with_rule(Box::new(DrcCourtyardOverlapRule::new()))
+            .with_rule(Box::new(DrcTraceWidthRule::new()))
     }
 }
 impl Default for DrcVerificationMachine {
@@ -67,10 +71,11 @@ impl Machine for DrcVerificationMachine {
                 let nets = ctx.nets();
                 let parts = ctx.parts();
                 let bom_line_items = ctx.bom_line_items();
-                // Bind the owned board/placements to locals so their borrows outlive the
+                // Bind the owned board/placements/tracks to locals so their borrows outlive the
                 // context the engine reasons over.
                 let board = ctx.board();
                 let placements = ctx.placements();
+                let tracks = ctx.tracks();
                 let findings = engine.run(&VerificationContext {
                     requirements: &requirements,
                     constraints: &constraints,
@@ -81,6 +86,7 @@ impl Machine for DrcVerificationMachine {
                     bom_line_items: &bom_line_items,
                     board: board.as_ref(),
                     placements: &placements,
+                    tracks: &tracks,
                 });
 
                 let existing = ctx.violations();
@@ -103,9 +109,11 @@ impl Machine for DrcVerificationMachine {
                         message: finding.message.clone(),
                         status: ViolationStatus::Open,
                     };
-                    // Link the violation to each implicated placement; combined with the
-                    // placements' own TracesTo links this completes the trace
-                    // Violation -> Placement -> Component -> Block -> Requirement -> Intent.
+                    // Link the violation to each implicated subject — a placement (geometry
+                    // rules) or a track (trace-width rule). Combined with the subject's own
+                    // TracesTo links this completes the trace back to intent, e.g.
+                    // Violation -> Placement -> Component -> Block -> Requirement -> Intent, or
+                    // Violation -> Track -> Net -> ... -> Requirement -> Intent.
                     let links: Vec<ProvenanceLink> = finding
                         .subjects
                         .iter()

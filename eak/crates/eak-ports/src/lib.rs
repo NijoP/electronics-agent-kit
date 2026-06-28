@@ -11,7 +11,7 @@
 
 use eak_domain::{
     Board, BomLineItem, Component, Constraint, Decision, DesignIntent, Evidence, FunctionalBlock,
-    Net, Part, Pin, Placement, Priority, ProvenanceLink, Requirement, RequirementCategory,
+    Net, Part, Pin, Placement, Priority, ProvenanceLink, Requirement, RequirementCategory, Track,
     Violation, Waiver,
 };
 use eak_units::PhysicalQuantity;
@@ -151,10 +151,21 @@ pub enum Event {
         placement: Placement,
     },
 
+    // ---- Phase 3 (routing): routing state delta ----
+    TrackCommitted {
+        track: Track,
+    },
+
     // ---- Phase 3 (PCB): IR boundary milestone (audit) ----
     PcbIrProduced {
         schema_version: u32,
         placement_count: usize,
+    },
+
+    // ---- Phase 3 (routing): IR enrichment milestone (audit) ----
+    PcbIrEnriched {
+        schema_version: u32,
+        track_count: usize,
     },
 }
 

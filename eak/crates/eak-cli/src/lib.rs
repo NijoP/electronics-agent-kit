@@ -10,7 +10,7 @@ use eak_phases::{
     BomPlanningMachine, BomVerificationMachine, ComponentPlacementMachine,
     ConstraintExtractionMachine, ConstraintVerificationMachine, DrcVerificationMachine,
     EngineeringAnalysisMachine, ErcVerificationMachine, PcbFloorPlanningMachine,
-    RequirementPlanningMachine, SchematicPlanningMachine,
+    RequirementPlanningMachine, RoutingPlanningMachine, SchematicPlanningMachine,
 };
 use eak_ports::ReasoningEngine;
 use eak_reasoning::{Cassette, FixtureEngine};
@@ -140,19 +140,19 @@ pub fn run_with(
 /// The default Phase-3 workflow: Requirement Planning -> Engineering Analysis ->
 /// Constraint Extraction -> Constraint Verification -> Schematic Planning -> ERC
 /// Verification -> BOM Planning -> BOM Verification -> PCB Floor Planning ->
-/// Component Placement -> DRC Verification. Only Requirement Planning reasons (P3);
-/// every other phase here is deterministic, so a run replays bit-identically (P4).
+/// Component Placement -> Routing Planning -> DRC Verification. Only Requirement Planning
+/// reasons (P3); every other phase here is deterministic, so a run replays bit-identically (P4).
 ///
 /// Four correctness-loop edges bound the self-correction: a failed constraint verification
 /// routes back to extraction, a failed ERC routes back to schematic planning, a failed
-/// BOM verification routes back to BOM planning, and a failed DRC routes back to component
-/// placement (each capped at `max_retries` 2). Because extraction, schematic planning, BOM
-/// planning, and component placement are *idempotent* (a re-entry produces the identical
-/// artifact), the loop is a no-op recovery for a design that is genuinely infeasible: it
-/// deterministically exhausts the retries and then surfaces the open, blocking violation
-/// rather than looping forever (P13). The loop-back is the seam where a future
-/// reasoning-assisted re-synthesis (or a human waiver between passes) can actually change the
-/// artifact and clear the violation.
+/// BOM verification routes back to BOM planning, and a failed DRC routes back to routing
+/// planning (clearance/geometry defects are routing defects — the canonical loop-back target;
+/// each capped at `max_retries` 2). Because extraction, schematic planning, BOM planning, and
+/// routing planning are *idempotent* (a re-entry produces the identical artifact), the loop is a
+/// no-op recovery for a design that is genuinely infeasible: it deterministically exhausts the
+/// retries and then surfaces the open, blocking violation rather than looping forever (P13). The
+/// loop-back is the seam where a future reasoning-assisted re-synthesis (or a human waiver
+/// between passes) can actually change the artifact and clear the violation.
 fn default_workflow() -> WorkflowPlan {
     WorkflowPlan::with_loopbacks(
         vec![
@@ -166,6 +166,7 @@ fn default_workflow() -> WorkflowPlan {
             Box::new(BomVerificationMachine::new()),
             Box::new(PcbFloorPlanningMachine::new()),
             Box::new(ComponentPlacementMachine::new()),
+            Box::new(RoutingPlanningMachine::new()),
             Box::new(DrcVerificationMachine::new()),
         ],
         vec![
@@ -186,7 +187,7 @@ fn default_workflow() -> WorkflowPlan {
             },
             LoopBack {
                 from: "DrcVerification".into(),
-                to: "ComponentPlacement".into(),
+                to: "RoutingPlanning".into(),
                 max_retries: 2,
             },
         ],

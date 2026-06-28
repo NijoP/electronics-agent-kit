@@ -53,7 +53,7 @@ mod kernel_tests {
     use eak_domain::{
         Board, BoardSide, BomLineItem, Component, ComponentClass, Decision, EntityId,
         FunctionalBlock, Net, NetClass, Part, PartLifecycle, Pin, PinElectricalType, Placement,
-        Priority, Requirement, RequirementCategory, RequirementStatus,
+        Priority, Requirement, RequirementCategory, RequirementStatus, Track,
     };
     use eak_ports::{
         Event, EventLog, EventRecord, ReasoningEngine, ReasoningError, ReasoningRequest,
@@ -772,5 +772,133 @@ mod kernel_tests {
         // Exactly one placement landed, on the single committed board.
         assert_eq!(core.state.placements.len(), 1);
         assert!(core.state.board.is_some());
+    }
+
+    /// The routing seam mirrors the placement seam: a track is rejected before any board
+    /// exists, when it realizes an unknown net, and on a second route of an already-routed net;
+    /// a well-formed track for a committed net on a committed board commits exactly once.
+    #[test]
+    fn phase3_routing_handler_rejects_untraceable_proposals_at_the_seam() {
+        let mut core = new_core();
+        let mm = |v: f64| PhysicalQuantity::new(v, Unit::Millimetre);
+        let track = |id: EntityId, net: EntityId| CapabilityRequest::RouteNet {
+            track: Track {
+                id,
+                net,
+                layer: BoardSide::Top,
+                width: mm(0.25),
+                x1: mm(1.0),
+                y1: mm(1.0),
+                x2: mm(9.0),
+                y2: mm(1.0),
+            },
+            links: vec![],
+        };
+
+        // Build a real requirement -> block -> component (+ pin) -> net to route.
+        core.capture_intent("intent", "engineer").unwrap();
+        let src = core.state.intent.as_ref().unwrap().id;
+        let rid = core.fresh_id();
+        let did = core.fresh_id();
+        core.invoke(CapabilityRequest::CreateRequirement {
+            requirement: Requirement {
+                id: rid,
+                statement: "Device shall do a thing".into(),
+                category: RequirementCategory::Functional,
+                priority: Priority::High,
+                acceptance_criterion: "it does the thing".into(),
+                status: RequirementStatus::Accepted,
+                source: src,
+                targets: vec![],
+            },
+            decision: Decision {
+                id: did,
+                subject: rid,
+                rationale: "from intent".into(),
+                decider: "test".into(),
+                reasoning_call_seq: None,
+                evidence: vec![],
+                confidence: 1.0,
+            },
+            evidence: vec![],
+            links: vec![],
+        })
+        .unwrap();
+        let block_id = core.fresh_id();
+        core.invoke(CapabilityRequest::CreateFunctionalBlock {
+            block: FunctionalBlock {
+                id: block_id,
+                name: "blk".into(),
+                function: "f".into(),
+                requirements: vec![rid],
+            },
+            links: vec![],
+        })
+        .unwrap();
+        let comp_id = core.fresh_id();
+        let pin_id = core.fresh_id();
+        core.invoke(CapabilityRequest::RealizeComponent {
+            component: Component {
+                id: comp_id,
+                refdes: "U1".into(),
+                class: ComponentClass::Ic,
+                value: None,
+                from_block: block_id,
+            },
+            pins: vec![Pin {
+                id: pin_id,
+                component: comp_id,
+                designation: "VDD".into(),
+                electrical_type: PinElectricalType::PowerIn,
+            }],
+            links: vec![],
+        })
+        .unwrap();
+        let net_id = core.fresh_id();
+        core.invoke(CapabilityRequest::CreateNet {
+            net: Net {
+                id: net_id,
+                name: "VBUS".into(),
+                class: NetClass::Power,
+                members: vec![pin_id],
+            },
+            links: vec![],
+        })
+        .unwrap();
+
+        // Routing before any board outline exists is rejected (board precedes routing).
+        let t0 = core.fresh_id();
+        let err = core.invoke(track(t0, net_id)).unwrap_err();
+        assert!(matches!(err, CapabilityError::Rejected(_)));
+
+        // Commit the board, then routing a phantom net is rejected (referential integrity).
+        let board_id = core.fresh_id();
+        core.invoke(CapabilityRequest::CreateBoard {
+            board: Board {
+                id: board_id,
+                width: mm(50.0),
+                height: mm(50.0),
+                layers: 2,
+            },
+            links: vec![],
+        })
+        .unwrap();
+        let t1 = core.fresh_id();
+        let phantom = core.fresh_id();
+        let err = core.invoke(track(t1, phantom)).unwrap_err();
+        assert!(matches!(err, CapabilityError::Rejected(_)));
+
+        // Routing the real net once succeeds; a second route of the same net is rejected.
+        let t2 = core.fresh_id();
+        core.invoke(track(t2, net_id)).unwrap();
+        let t3 = core.fresh_id();
+        let err = core.invoke(track(t3, net_id)).unwrap_err();
+        assert!(matches!(err, CapabilityError::Rejected(_)));
+
+        // Exactly one track landed; replay reconstructs byte-identical state.
+        assert_eq!(core.state.tracks.len(), 1);
+        let replayed = replay(core.log()).unwrap();
+        assert_eq!(core.state, replayed);
+        assert_eq!(core.state.canonical_json(), replayed.canonical_json());
     }
 }

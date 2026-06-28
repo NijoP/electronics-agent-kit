@@ -533,6 +533,57 @@ impl Placement {
     }
 }
 
+// =================== Phase 3 (increment 4): routing entities ===================
+//
+// The routing layer realizes the abstract schematic [`Net`]s physically as copper: a
+// [`Track`] binds one [`Net`] to a copper segment of a given `width` on one [`BoardSide`]
+// layer, running from (`x1`,`y1`) to (`x2`,`y2`). One track realizes one net
+// (net-realization completeness — the routing invariant), so a track is always traceable
+// back through its net to the schematic and on to intent (P3). Physical values are typed
+// [`PhysicalQuantity`]s (P9), compared via `si_magnitude()` so trace-width DRC stays
+// dimensionally unambiguous. Net-link and net-existence integrity are re-checked at the
+// capability seam (P3). See `docs/state-machines/routing-planning.md`.
+
+/// A copper realization of one [`Net`]: a trace of `width` on one [`BoardSide`] layer,
+/// running from (`x1`,`y1`) to (`x2`,`y2`). Positions and width are typed
+/// [`PhysicalQuantity`]s (P9), so `Track` is not `Eq`. Net-link integrity is re-checked at
+/// the capability seam (P3).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Track {
+    pub id: EntityId,
+    /// The net this track realizes.
+    pub net: EntityId,
+    pub layer: BoardSide,
+    /// The copper width of the trace (P9).
+    pub width: PhysicalQuantity,
+    pub x1: PhysicalQuantity,
+    pub y1: PhysicalQuantity,
+    pub x2: PhysicalQuantity,
+    pub y2: PhysicalQuantity,
+}
+
+impl Track {
+    /// Domain invariants: a trace has a positive, finite copper width — a zero/negative-width
+    /// trace carries no copper and cannot be DRC-checked — and finite endpoints. Width is
+    /// compared via `si_magnitude()` so the check is unit-independent (P9). Net-link existence
+    /// is re-checked at the capability seam (P3).
+    pub fn validate(&self) -> Result<(), DomainError> {
+        if !self.width.si_magnitude().is_finite() || self.width.si_magnitude() <= 0.0 {
+            return Err(DomainError::Inconsistent(
+                "track width must be positive and finite",
+            ));
+        }
+        if !self.x1.si_magnitude().is_finite()
+            || !self.y1.si_magnitude().is_finite()
+            || !self.x2.si_magnitude().is_finite()
+            || !self.y2.si_magnitude().is_finite()
+        {
+            return Err(DomainError::Inconsistent("track endpoints must be finite"));
+        }
+        Ok(())
+    }
+}
+
 /// A violated domain invariant.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DomainError {
@@ -901,5 +952,49 @@ mod tests {
             side: BoardSide::Top,
         };
         assert!(p.validate().is_ok());
+    }
+
+    fn track(width: f64) -> Track {
+        Track {
+            id: EntityId(1),
+            net: EntityId(2),
+            layer: BoardSide::Top,
+            width: mm(width),
+            x1: mm(1.0),
+            y1: mm(1.0),
+            x2: mm(9.0),
+            y2: mm(1.0),
+        }
+    }
+
+    #[test]
+    fn track_rejects_non_positive_width() {
+        assert_eq!(
+            track(0.0).validate(),
+            Err(DomainError::Inconsistent(
+                "track width must be positive and finite"
+            ))
+        );
+        assert_eq!(
+            track(-0.2).validate(),
+            Err(DomainError::Inconsistent(
+                "track width must be positive and finite"
+            ))
+        );
+    }
+
+    #[test]
+    fn track_rejects_non_finite_endpoint() {
+        let mut t = track(0.25);
+        t.x2 = mm(f64::INFINITY);
+        assert_eq!(
+            t.validate(),
+            Err(DomainError::Inconsistent("track endpoints must be finite"))
+        );
+    }
+
+    #[test]
+    fn well_formed_track_validates() {
+        assert!(track(0.25).validate().is_ok());
     }
 }

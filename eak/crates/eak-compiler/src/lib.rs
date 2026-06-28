@@ -6,7 +6,7 @@
 
 use eak_domain::{
     Board, BomLineItem, Component, Constraint, DesignIntent, EntityId, FunctionalBlock, Net, Part,
-    Pin, Placement, ProvenanceLink, Requirement, RequirementStatus,
+    Pin, Placement, ProvenanceLink, Requirement, RequirementStatus, Track,
 };
 use serde::{Deserialize, Serialize};
 
@@ -29,6 +29,7 @@ pub enum IrError {
     NoBoard,
     PlacementUnknownComponent(EntityId),
     UnplacedComponent(EntityId),
+    TrackUnknownNet(EntityId),
 }
 impl std::fmt::Display for IrError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -85,6 +86,9 @@ impl std::fmt::Display for IrError {
                     "schematic component {} is not placed on the board",
                     id.short()
                 )
+            }
+            IrError::TrackUnknownNet(id) => {
+                write!(f, "track realizes unknown net {}", id.short())
             }
         }
     }
@@ -272,28 +276,40 @@ impl BomIr {
     }
 }
 
-/// The fifth IR: the PCB layout at the boundary out of Component Placement — the physical
-/// [`Board`] outline, the [`Placement`]s binding schematic [`Component`]s to positions, and
-/// the components they place. A projection of canonical state (P6); never a rival source of
-/// truth. Physical values stay typed [`PhysicalQuantity`]s, so DRC downstream is unambiguous.
+/// The fifth IR: the PCB layout at the boundary out of Component Placement, **enriched** by
+/// Routing Planning — the physical [`Board`] outline, the [`Placement`]s binding schematic
+/// [`Component`]s to positions, the [`Track`]s realizing the nets, and the components they
+/// place. A projection of canonical state (P6); never a rival source of truth. Physical values
+/// stay typed [`PhysicalQuantity`]s, so DRC downstream is unambiguous. `tracks` is empty at the
+/// Component Placement boundary and populated once Routing Planning has run.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PcbIr {
     pub schema_version: u32,
     pub schematic_ir_schema_version: u32,
     pub board: Board,
     pub placements: Vec<Placement>,
+    pub tracks: Vec<Track>,
     pub components: Vec<Component>,
 }
 
 impl PcbIr {
     /// Project canonical state into the PCB IR (transformation P1), enforcing layout
     /// integrity: a board outline exists (else [`IrError::NoBoard`]); every placement binds a
-    /// component that exists upstream in the schematic (P3); and every schematic component is
-    /// placed — nothing reaches manufacturing unplaced (P13).
+    /// component that exists upstream in the schematic (P3); every schematic component is
+    /// placed — nothing reaches manufacturing unplaced (P13); and every track realizes a net
+    /// that exists upstream in the schematic — no track dangles off a phantom net (P3).
+    ///
+    /// Net-realization *completeness* (every net realized by a track) is NOT enforced here:
+    /// the projection runs at the Component Placement boundary too, before any routing exists,
+    /// so requiring a track per net would falsely reject the unrouted-but-valid placed board.
+    /// Completeness is the routing phase's own concern; in Phase-3 scope it rests on the
+    /// `UnplacedComponent` invariant above (every component placed => every net member routable),
+    /// not on a downstream DRC rule (none exists for unrouted nets yet).
     pub fn project(
         schematic: &SchematicIr,
         board: Option<&Board>,
         placements: &[Placement],
+        tracks: &[Track],
     ) -> Result<Self, IrError> {
         // invariant: a board outline must precede any layout (P3).
         let board = board.ok_or(IrError::NoBoard)?;
@@ -313,11 +329,18 @@ impl PcbIr {
                 return Err(IrError::UnplacedComponent(c.id));
             }
         }
+        // invariant: every track realizes a real schematic net (P3) — no dangling copper.
+        for track in tracks {
+            if !schematic.nets.iter().any(|n| n.id == track.net) {
+                return Err(IrError::TrackUnknownNet(track.net));
+            }
+        }
         Ok(Self {
             schema_version: PCB_IR_SCHEMA_VERSION,
             schematic_ir_schema_version: schematic.schema_version,
             board: board.clone(),
             placements: placements.to_vec(),
+            tracks: tracks.to_vec(),
             components: schematic.components.clone(),
         })
     }
@@ -569,12 +592,13 @@ mod tests {
         let sch = schematic_ir();
         let b = board(80);
         let pl = placement(70, EntityId(20));
-        let pcb = PcbIr::project(&sch, Some(&b), &[pl]).unwrap();
+        let pcb = PcbIr::project(&sch, Some(&b), &[pl], &[]).unwrap();
         assert_eq!(pcb.schema_version, PCB_IR_SCHEMA_VERSION);
         assert_eq!(pcb.schematic_ir_schema_version, sch.schema_version);
         assert_eq!(pcb.board.id, EntityId(80));
         assert_eq!(pcb.placements.len(), 1);
         assert_eq!(pcb.placements[0].component, EntityId(20));
+        assert!(pcb.tracks.is_empty());
         assert_eq!(pcb.components.len(), 1);
     }
 
@@ -583,7 +607,7 @@ mod tests {
         let sch = schematic_ir();
         // a layout without a board outline cannot be projected.
         assert!(matches!(
-            PcbIr::project(&sch, None, &[placement(70, EntityId(20))]),
+            PcbIr::project(&sch, None, &[placement(70, EntityId(20))], &[]),
             Err(IrError::NoBoard)
         ));
     }
@@ -593,7 +617,7 @@ mod tests {
         let sch = schematic_ir();
         // placement binds a component (99) that is not in the schematic.
         assert!(matches!(
-            PcbIr::project(&sch, Some(&board(80)), &[placement(70, EntityId(99))]),
+            PcbIr::project(&sch, Some(&board(80)), &[placement(70, EntityId(99))], &[]),
             Err(IrError::PlacementUnknownComponent(_))
         ));
     }
@@ -603,8 +627,60 @@ mod tests {
         let sch = schematic_ir();
         // schematic component 20 is never placed on the board.
         assert!(matches!(
-            PcbIr::project(&sch, Some(&board(80)), &[]),
+            PcbIr::project(&sch, Some(&board(80)), &[], &[]),
             Err(IrError::UnplacedComponent(_))
+        ));
+    }
+
+    fn track(id: u128, net: EntityId) -> Track {
+        Track {
+            id: EntityId(id),
+            net,
+            layer: BoardSide::Top,
+            width: qty(0.25),
+            x1: qty(1.0),
+            y1: qty(1.0),
+            x2: qty(9.0),
+            y2: qty(1.0),
+        }
+    }
+
+    /// A schematic carrying one component, its pin, and a net joining that pin — enough to
+    /// route a track against.
+    fn routed_schematic() -> SchematicIr {
+        let eng = EngineeringIr::project(&req_ir(), &[block(10, vec![EntityId(2)])], &[]).unwrap();
+        let c = component(20, EntityId(10));
+        let p = pin(30, EntityId(20));
+        let n = net(40, vec![EntityId(30)]);
+        SchematicIr::project(&eng, &[c], &[p], &[n]).unwrap()
+    }
+
+    #[test]
+    fn pcb_project_enriches_with_tracks() {
+        let sch = routed_schematic();
+        let pcb = PcbIr::project(
+            &sch,
+            Some(&board(80)),
+            &[placement(70, EntityId(20))],
+            &[track(90, EntityId(40))],
+        )
+        .unwrap();
+        assert_eq!(pcb.tracks.len(), 1);
+        assert_eq!(pcb.tracks[0].net, EntityId(40));
+    }
+
+    #[test]
+    fn pcb_project_rejects_track_unknown_net() {
+        let sch = routed_schematic();
+        // a track realizing a net (99) that is not in the schematic.
+        assert!(matches!(
+            PcbIr::project(
+                &sch,
+                Some(&board(80)),
+                &[placement(70, EntityId(20))],
+                &[track(90, EntityId(99))]
+            ),
+            Err(IrError::TrackUnknownNet(_))
         ));
     }
 }

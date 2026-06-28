@@ -12,6 +12,7 @@ pub mod engineering_analysis;
 pub mod erc_verification;
 pub mod pcb_floor_planning;
 pub mod requirement_planning;
+pub mod routing_planning;
 pub mod schematic_planning;
 
 pub use agent::RequirementAgent;
@@ -25,6 +26,7 @@ pub use engineering_analysis::EngineeringAnalysisMachine;
 pub use erc_verification::ErcVerificationMachine;
 pub use pcb_floor_planning::PcbFloorPlanningMachine;
 pub use requirement_planning::RequirementPlanningMachine;
+pub use routing_planning::RoutingPlanningMachine;
 pub use schematic_planning::SchematicPlanningMachine;
 
 #[cfg(test)]
@@ -652,20 +654,25 @@ mod tests {
             Box::new(BomVerificationMachine::new()),
             Box::new(PcbFloorPlanningMachine::new()),
             Box::new(ComponentPlacementMachine::new()),
+            Box::new(RoutingPlanningMachine::new()),
             Box::new(DrcVerificationMachine::new()),
         ]);
         let results = Orchestrator::new().run(&mut plan, &mut core);
 
-        assert_eq!(results.len(), 11);
+        assert_eq!(results.len(), 12);
         assert!(results.iter().all(|(_, o)| *o == PhaseOutcome::Success));
         // The PCB layer exists: an outline plus one placement per realized component, all
-        // within bounds and non-overlapping, so the DRC is clean.
+        // within bounds and non-overlapping, so the placement DRC is clean.
         assert!(core.state.board.is_some());
         assert!(!core.state.placements.is_empty());
         assert_eq!(core.state.placements.len(), core.state.components.len());
+        // The routing layer exists: every net is realized by exactly one track, and with no
+        // process floor stated the trace-width DRC is clean too.
+        assert!(!core.state.tracks.is_empty());
+        assert_eq!(core.state.tracks.len(), core.state.nets.len());
         assert!(core.state.violations.is_empty());
 
-        // byte-identical replay holds across the whole 11-phase run.
+        // byte-identical replay holds across the whole 12-phase run.
         let replayed = replay(core.log()).unwrap();
         assert_eq!(core.state, replayed);
         assert_eq!(core.state.canonical_json(), replayed.canonical_json());
@@ -754,15 +761,18 @@ mod tests {
             Box::new(BomVerificationMachine::new()),
             Box::new(PcbFloorPlanningMachine::new()),
             Box::new(ComponentPlacementMachine::new()),
+            Box::new(RoutingPlanningMachine::new()),
             Box::new(DrcVerificationMachine::new()),
         ]);
         let results = Orchestrator::new().run(&mut plan, &mut core);
-        assert_eq!(results.len(), 11);
+        assert_eq!(results.len(), 12);
 
         // ERC (index 5) and BOM Verification (index 7) both passed.
         assert_eq!(results[5].1, PhaseOutcome::Success);
         assert_eq!(results[7].1, PhaseOutcome::Success);
-        // The final phase (DRC Verification) failed.
+        // Routing Planning (index 10) ran clean — it routes the placed (if off-board) nets.
+        assert_eq!(results[10].1, PhaseOutcome::Success);
+        // The final phase (DRC Verification) failed on the off-board courtyard.
         assert_eq!(results.last().unwrap().0, "DrcVerification");
         assert!(matches!(results.last().unwrap().1, PhaseOutcome::Failed(_)));
 
@@ -793,6 +803,144 @@ mod tests {
         assert_eq!(outcome, PhaseOutcome::Success);
         assert_eq!(core.state.violations.len(), 1); // no duplicate raised
         assert_eq!(core.state.waivers.len(), 1);
+
+        // replay identity holds across the run + waive + re-verify.
+        let replayed = replay(core.log()).unwrap();
+        assert_eq!(core.state, replayed);
+    }
+
+    /// A reasoner that yields a driven, manufacturable design (a USB-C source + a load, so ERC
+    /// and BOM are clean and the default 100 mm board fits the layout) plus a Regulatory
+    /// fabrication-process requirement carrying a 0.5 mm trace-width floor. The router routes
+    /// every net at the 0.25 mm default, finer than the 0.5 mm process floor, so DRC's
+    /// trace-width rule flags each routed track.
+    struct TraceFloorReasoner;
+    impl ReasoningEngine for TraceFloorReasoner {
+        fn model_id(&self) -> String {
+            "trace-floor".into()
+        }
+        fn request_judgement(
+            &self,
+            _req: &ReasoningRequest,
+        ) -> Result<ReasoningResponse, ReasoningError> {
+            use eak_units::{PhysicalQuantity, Unit};
+            Ok(ReasoningResponse {
+                candidates: vec![
+                    CandidateRequirement {
+                        statement: "USB-C connector shall supply 5 V to the board".into(),
+                        category: RequirementCategory::Functional,
+                        priority: Priority::High,
+                        acceptance_criterion: "VBUS present at 5 V".into(),
+                        source_hint: "intent: USB-C power entry".into(),
+                        confidence: 0.9,
+                        rationale: "power entry".into(),
+                        targets: vec![],
+                    },
+                    CandidateRequirement {
+                        statement: "Microcontroller shall run the sensing firmware".into(),
+                        category: RequirementCategory::Electrical,
+                        priority: Priority::High,
+                        acceptance_criterion: "firmware boots and samples".into(),
+                        source_hint: "intent: sensing load".into(),
+                        confidence: 0.9,
+                        rationale: "compute load".into(),
+                        targets: vec![],
+                    },
+                    // A Regulatory requirement whose length target is the fabrication process's
+                    // minimum trace width — the floor DRC's trace-width rule checks against.
+                    CandidateRequirement {
+                        statement: "Fabrication process supports a 0.5 mm minimum trace width"
+                            .into(),
+                        category: RequirementCategory::Regulatory,
+                        priority: Priority::High,
+                        acceptance_criterion: "every trace is at least 0.5 mm wide".into(),
+                        source_hint: "intent: fab process class".into(),
+                        confidence: 0.9,
+                        rationale: "process floor".into(),
+                        targets: vec![PhysicalQuantity::new(0.5, Unit::Millimetre)],
+                    },
+                ],
+                clarifying_questions: vec![],
+                raw: "{}".into(),
+            })
+        }
+    }
+
+    #[test]
+    fn drc_trace_width_waiver_lets_reverification_pass() {
+        let mut core = RuntimeCore::new(
+            Box::new(MemLog { records: vec![] }),
+            Box::new(TraceFloorReasoner),
+            Box::new(SeededIdSource::new(7)),
+            Box::new(LogicalClock::new()),
+            Autonomy::Autonomous,
+        );
+        core.capture_intent("USB-C sensor node on a coarse fab process", "engineer")
+            .unwrap();
+
+        // Run the full 12-phase chain linearly. ERC and BOM are clean (a driven rail, Active
+        // parts) and the placement geometry fits the default board, but every routed trace is
+        // finer than the 0.5 mm process floor, so DRC fails on the trace-width rule.
+        let mut plan = WorkflowPlan::new(vec![
+            Box::new(RequirementPlanningMachine::new()),
+            Box::new(EngineeringAnalysisMachine::new()),
+            Box::new(ConstraintExtractionMachine::new()),
+            Box::new(ConstraintVerificationMachine::new()),
+            Box::new(SchematicPlanningMachine::new()),
+            Box::new(ErcVerificationMachine::new()),
+            Box::new(BomPlanningMachine::new()),
+            Box::new(BomVerificationMachine::new()),
+            Box::new(PcbFloorPlanningMachine::new()),
+            Box::new(ComponentPlacementMachine::new()),
+            Box::new(RoutingPlanningMachine::new()),
+            Box::new(DrcVerificationMachine::new()),
+        ]);
+        let results = Orchestrator::new().run(&mut plan, &mut core);
+        assert_eq!(results.len(), 12);
+        assert_eq!(results.last().unwrap().0, "DrcVerification");
+        assert!(matches!(results.last().unwrap().1, PhaseOutcome::Failed(_)));
+
+        // Every blocking violation is a trace-width finding — one per routed track — and no
+        // other rule fired (placement geometry is clean).
+        let tw: Vec<_> = core
+            .state
+            .violations
+            .iter()
+            .filter(|v| v.rule == "drc-trace-width")
+            .collect();
+        assert!(!tw.is_empty());
+        assert_eq!(tw.len(), core.state.tracks.len());
+        assert!(tw.iter().all(|v| v.is_blocking()));
+        assert_eq!(core.state.open_blocking_violations().len(), tw.len());
+        // Each violation names a routed track (the traceability anchor back to its net).
+        for v in &tw {
+            assert_eq!(v.subjects.len(), 1);
+            assert!(core.state.track(v.subjects[0]).is_some());
+        }
+
+        // Accept every trace-width violation via the only write path — the Capability port (P2).
+        let vids: Vec<_> = tw.iter().map(|v| v.id).collect();
+        for vid in vids {
+            let wid = core.fresh_id();
+            core.invoke(CapabilityRequest::GrantWaiver {
+                waiver: Waiver {
+                    id: wid,
+                    violation: vid,
+                    justification: "fine traces accepted for prototype bring-up".into(),
+                    decided_by: "engineer".into(),
+                },
+            })
+            .expect("waiver granted");
+        }
+        assert!(core.state.open_blocking_violations().is_empty());
+
+        // Re-verify DRC: the fine traces are still found, but the violations are waived, so no
+        // new violation is raised and nothing blocks — the phase now passes.
+        let raised_before = core.state.violations.len();
+        let mut drc = DrcVerificationMachine::new();
+        let outcome = ExecutionEngine::new().run(&mut drc, &mut core);
+        assert_eq!(outcome, PhaseOutcome::Success);
+        assert_eq!(core.state.violations.len(), raised_before); // no duplicates raised
 
         // replay identity holds across the run + waive + re-verify.
         let replayed = replay(core.log()).unwrap();

@@ -6,7 +6,7 @@
 
 use eak_domain::{
     Board, BomLineItem, Component, Constraint, Decision, DesignIntent, EntityId, Evidence,
-    FunctionalBlock, Net, Part, Pin, Placement, ProvenanceLink, Requirement, Violation,
+    FunctionalBlock, Net, Part, Pin, Placement, ProvenanceLink, Requirement, Track, Violation,
     ViolationStatus, Waiver,
 };
 use eak_ports::Event;
@@ -36,6 +36,8 @@ pub struct EngineeringState {
     // Phase 3 (PCB): the single board outline plus each component's placement on it.
     pub board: Option<Board>,
     pub placements: Vec<Placement>,
+    // Phase 3 (routing): the copper tracks realizing the nets.
+    pub tracks: Vec<Track>,
 }
 
 impl EngineeringState {
@@ -76,6 +78,7 @@ impl EngineeringState {
             Event::BomLineItemCommitted { item } => self.bom_line_items.push(item.clone()),
             Event::BoardCommitted { board } => self.board = Some(board.clone()),
             Event::PlacementCommitted { placement } => self.placements.push(placement.clone()),
+            Event::TrackCommitted { track } => self.tracks.push(track.clone()),
             // Audit-only events (phase lifecycle, reasoning calls, IR-boundary milestones)
             // carry no state and are intentionally not folded. AUDIT: any NEW state-bearing
             // event variant MUST get an explicit arm above, or replay will silently diverge.
@@ -133,6 +136,10 @@ impl EngineeringState {
 
     pub fn placement(&self, id: EntityId) -> Option<&Placement> {
         self.placements.iter().find(|p| p.id == id)
+    }
+
+    pub fn track(&self, id: EntityId) -> Option<&Track> {
+        self.tracks.iter().find(|t| t.id == id)
     }
 
     /// Open, blocking (error-severity) violations — the workflow gate (P13).

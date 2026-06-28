@@ -1,16 +1,17 @@
-//! End-to-end verification of the Phase-3 exit criteria over the full 11-phase workflow:
+//! End-to-end verification of the Phase-3 exit criteria over the full 12-phase workflow:
 //! Requirement Planning -> Engineering Analysis -> Constraint Extraction -> Constraint
 //! Verification -> Schematic Planning -> ERC Verification -> BOM Planning -> BOM Verification
-//! -> PCB Floor Planning -> Component Placement -> DRC Verification. A consistent, realizable
-//! design runs all eleven phases clean and lands a placed board. Four kinds of fault are each
-//! caught at their gate, routed back automatically, and left fully traceable to their cause: an
-//! infeasible constraint pair (Constraint Verification), an electrically-invalid power net with
-//! consumers but no driver (ERC), a procurement fault — an end-of-life catalog part — at the
-//! BOM lifecycle gate, and a courtyard that runs off an undersized board outline (DRC). The
-//! first three faults stop the workflow before any of the PCB phases run; the DRC fault is the
-//! last gate. The Phase-1/2 guarantees (multi-phase orchestration, full requirement
-//! traceability, the correctness loops, byte-identical replay) still hold over the larger
-//! workflow.
+//! -> PCB Floor Planning -> Component Placement -> Routing Planning -> DRC Verification. A
+//! consistent, realizable design runs all twelve phases clean and lands a placed, routed board.
+//! Five kinds of fault are each caught at their gate, routed back automatically, and left fully
+//! traceable to their cause: an infeasible constraint pair (Constraint Verification), an
+//! electrically-invalid power net with consumers but no driver (ERC), a procurement fault — an
+//! end-of-life catalog part — at the BOM lifecycle gate, a courtyard that runs off an undersized
+//! board outline (DRC out-of-bounds), and a trace finer than the fabrication process floor (DRC
+//! trace-width). The first three faults stop the workflow before any of the PCB phases run; the
+//! two DRC faults are the last gate, which loops back to Routing Planning. The Phase-1/2
+//! guarantees (multi-phase orchestration, full requirement traceability, the correctness loops,
+//! byte-identical replay) still hold over the larger workflow.
 
 use eak_cli::{
     replay_cmd, run, run_with, trace_cmd, PhaseOutcome, ReasoningChoice, Relation, RunConfig,
@@ -194,15 +195,61 @@ fn oversize_board_engine() -> Box<dyn ReasoningEngine> {
     }))
 }
 
+/// A reasoning engine for the routing trace-width scenario: a USB-C power-entry connector (a
+/// power source, so the rail is driven and ERC is clean) and one electrical load, both with no
+/// targets, plus a Regulatory fabrication-process requirement whose 0.5 mm length target is the
+/// minimum manufacturable trace width. With no Mechanical target the board defaults to a roomy
+/// 100 mm square, so the placement geometry is clean; but Routing Planning routes every net at
+/// the 0.25 mm default — finer than the 0.5 mm process floor — so DRC's trace-width rule flags
+/// each routed track. It is the one fault produced by the routing layer rather than placement.
+fn trace_floor_engine() -> Box<dyn ReasoningEngine> {
+    let usb_c = CandidateRequirement {
+        statement: "Device shall be powered over USB-C".into(),
+        category: RequirementCategory::Functional,
+        priority: Priority::High,
+        acceptance_criterion: "the device draws power through a USB-C receptacle".into(),
+        source_hint: "intent: USB-C power entry".into(),
+        confidence: 0.9,
+        rationale: "USB-C is the stated power interface".into(),
+        targets: vec![],
+    };
+    let load = CandidateRequirement {
+        statement: "Logic core shall operate at a 3.3 V logic level".into(),
+        category: RequirementCategory::Electrical,
+        priority: Priority::High,
+        acceptance_criterion: "core I/O is measured at a 3.3 V logic level".into(),
+        source_hint: "intent: logic core".into(),
+        confidence: 0.9,
+        rationale: "the digital core needs a defined logic level".into(),
+        targets: vec![],
+    };
+    let process = CandidateRequirement {
+        statement: "Fabrication process supports a 0.5 mm minimum trace width".into(),
+        category: RequirementCategory::Regulatory,
+        priority: Priority::High,
+        acceptance_criterion: "every trace is at least 0.5 mm wide".into(),
+        source_hint: "intent: fab process class".into(),
+        confidence: 0.9,
+        rationale: "the chosen fab process caps how fine a trace can be etched".into(),
+        targets: vec![PhysicalQuantity::new(0.5, Unit::Millimetre)],
+    };
+    Box::new(FixtureEngine::single(ReasoningResponse {
+        candidates: vec![usb_c, load, process],
+        clarifying_questions: vec![],
+        raw: "{}".into(),
+    }))
+}
+
 #[test]
-fn run_replays_byte_identical_and_runs_eleven_phases() {
+fn run_replays_byte_identical_and_runs_twelve_phases() {
     let (config, log) = cfg("det", 1);
     let report = run(&config).expect("run succeeds");
 
     // Full Phase-3 workflow on a consistent, realizable design: RP -> Engineering Analysis ->
     // Constraint Extraction -> Constraint Verification -> Schematic Planning -> ERC -> BOM
-    // Planning -> BOM Verification -> PCB Floor Planning -> Component Placement -> DRC, all OK.
-    assert_eq!(report.outcomes.len(), 11);
+    // Planning -> BOM Verification -> PCB Floor Planning -> Component Placement -> Routing
+    // Planning -> DRC, all OK.
+    assert_eq!(report.outcomes.len(), 12);
     assert!(report
         .outcomes
         .iter()
@@ -225,6 +272,10 @@ fn run_replays_byte_identical_and_runs_eleven_phases() {
     // The PCB layer landed: a board outline exists and every component was placed on it.
     assert!(report.state.board.is_some());
     assert!(!report.state.placements.is_empty());
+
+    // The routing layer landed: every net was realized by exactly one track.
+    assert!(!report.state.tracks.is_empty());
+    assert_eq!(report.state.tracks.len(), report.state.nets.len());
 
     // EXIT CRITERION (Phase 1, preserved): history replays to identical state, byte for byte.
     let replayed = replay_cmd(&log).expect("replay succeeds");
@@ -539,8 +590,9 @@ fn drc_oversize_board_is_caught_routed_back_and_left_traceable() {
     let (config, log) = cfg("drc", 11);
     let report = run_with(oversize_board_engine(), &config).expect("run completes with a failure");
 
-    // The PCB correctness loop fired: DRC failed and was routed back to Component Placement,
-    // bounded to 1 initial + 2 retries = 3 DRC runs, every one failing.
+    // The PCB correctness loop fired: DRC failed and was routed back to Routing Planning (the
+    // canonical loop-back target for clearance/geometry defects), bounded to 1 initial + 2
+    // retries = 3 DRC runs, every one failing.
     let drc_runs: Vec<&PhaseOutcome> = report
         .outcomes
         .iter()
@@ -651,6 +703,131 @@ fn drc_oversize_board_is_caught_routed_back_and_left_traceable() {
 }
 
 #[test]
+fn routing_trace_too_fine_is_caught_routed_back_and_left_traceable() {
+    let (config, log) = cfg("trace-width", 13);
+    let report = run_with(trace_floor_engine(), &config).expect("run completes with a failure");
+
+    // The PCB correctness loop fired: DRC failed and was routed back to Routing Planning (the
+    // canonical loop-back target for routing defects), bounded to 1 initial + 2 retries = 3 DRC
+    // runs, every one failing.
+    let drc_runs: Vec<&PhaseOutcome> = report
+        .outcomes
+        .iter()
+        .filter(|(n, _)| n == "DrcVerification")
+        .map(|(_, o)| o)
+        .collect();
+    assert_eq!(drc_runs.len(), 3);
+    assert!(drc_runs
+        .iter()
+        .all(|o| matches!(o, PhaseOutcome::Failed(_))));
+
+    // Routing Planning re-ran on each loop-back (idempotent): 1 initial + 2 re-entries.
+    let routing_runs = report
+        .outcomes
+        .iter()
+        .filter(|(n, _)| n == "RoutingPlanning")
+        .count();
+    assert_eq!(routing_runs, 3);
+
+    // The board was placed and routed clean upstream — the substrate DRC is checked against
+    // exists: an outline and one track per net.
+    assert!(report.state.board.is_some());
+    assert!(!report.state.tracks.is_empty());
+    assert_eq!(report.state.tracks.len(), report.state.nets.len());
+
+    // The workflow did not reach a clean end: its final phase is the failed DRC gate.
+    let (last_name, last_outcome) = report.outcomes.last().expect("at least one phase ran");
+    assert_eq!(last_name, "DrcVerification");
+    assert!(matches!(last_outcome, PhaseOutcome::Failed(_)));
+
+    // The only blocking violations are trace-width findings — one per routed track — each OPEN,
+    // Error-severity, and never double-raised across the loop-back re-verifications.
+    let trace_width: Vec<_> = report
+        .state
+        .violations
+        .iter()
+        .filter(|v| v.rule == "drc-trace-width")
+        .collect();
+    assert!(!trace_width.is_empty());
+    assert_eq!(trace_width.len(), report.state.tracks.len());
+    assert_eq!(
+        report.state.open_blocking_violations().len(),
+        trace_width.len(),
+        "the fine traces are the only blocking violations"
+    );
+    for v in &trace_width {
+        assert_eq!(v.status, ViolationStatus::Open);
+        assert_eq!(v.severity, ViolationSeverity::Error);
+        assert!(v.is_blocking());
+    }
+
+    // FULLY TRACEABLE across the routing layer: the violation names a track; walk
+    // track -> net -> member pins -> component -> functional block -> requirement -> design
+    // intent, checking the backing provenance link at each synthesized hop.
+    let intent = report.state.intent.as_ref().expect("intent captured");
+    let v = trace_width[0];
+    assert_eq!(v.subjects.len(), 1, "one fine trace implicated");
+    let tid = v.subjects[0];
+
+    // Violation -> Track (TracesTo), raised by DRC.
+    assert!(report
+        .state
+        .links
+        .iter()
+        .any(|l| l.from == v.id && l.to == tid && l.relation == Relation::TracesTo));
+
+    let track = report
+        .state
+        .track(tid)
+        .expect("violation subject is a known track");
+
+    // Track -> Net (TracesTo), recorded by Routing Planning.
+    assert!(report
+        .state
+        .links
+        .iter()
+        .any(|l| l.from == tid && l.to == track.net && l.relation == Relation::TracesTo));
+
+    let net = report
+        .state
+        .net(track.net)
+        .expect("track realizes a known net");
+    assert!(!net.members.is_empty(), "the routed net joins pins");
+    for pin_id in &net.members {
+        let pin = report
+            .state
+            .pin(*pin_id)
+            .expect("net member is a known pin");
+        let component = report
+            .state
+            .component(pin.component)
+            .expect("pin belongs to a known component");
+        let block = report
+            .state
+            .functional_block(component.from_block)
+            .expect("component was realized from a known block");
+        assert!(
+            !block.requirements.is_empty(),
+            "block realizes a requirement"
+        );
+        for req_id in &block.requirements {
+            let req = report
+                .state
+                .requirement(*req_id)
+                .expect("block realizes a known requirement");
+            assert_eq!(req.source, intent.id);
+        }
+    }
+
+    // Replay identity holds even for a failed, looped-back routing run.
+    let replayed = replay_cmd(&log).expect("replay succeeds");
+    assert_eq!(report.state, replayed);
+    assert_eq!(report.state.canonical_json(), replayed.canonical_json());
+
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
 fn every_requirement_is_fully_traceable() {
     let (config, log) = cfg("trace", 2);
     let report = run(&config).expect("run succeeds");
@@ -687,7 +864,7 @@ fn two_runs_with_same_seed_are_identical() {
     let (c2, l2) = cfg("rep2", 7);
     let r1 = run(&c1).expect("run 1");
     let r2 = run(&c2).expect("run 2");
-    // determinism of the run itself (seeded ids + logical clock) across the 11-phase workflow.
+    // determinism of the run itself (seeded ids + logical clock) across the 12-phase workflow.
     assert_eq!(r1.state, r2.state);
     let _ = std::fs::remove_file(&l1);
     let _ = std::fs::remove_file(&l2);

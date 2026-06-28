@@ -8,9 +8,9 @@
 use eak_domain::{
     Board, BomLineItem, Component, ComponentClass, Constraint, ConstraintKind, EntityId, Net,
     NetClass, Part, PartLifecycle, Pin, PinElectricalType, Placement, Requirement,
-    ViolationSeverity,
+    RequirementCategory, Track, ViolationSeverity,
 };
-use eak_units::{PhysicalQuantity, UnitError};
+use eak_units::{Dimension, PhysicalQuantity, UnitError};
 use std::cmp::Ordering;
 
 /// One step in an agent's elicitation reasoning-plan.
@@ -101,7 +101,8 @@ fn feasible_interval(c: &Constraint) -> (f64, f64) {
 /// BOM rules can reason over coverage and lifecycle, and the PCB layer (`board`, `placements`)
 /// so DRC rules can reason over physical fit and courtyard collisions (P9). `board` is
 /// `Option` because DRC runs only once an outline exists; when absent, geometry rules emit
-/// no findings rather than guessing a substrate.
+/// no findings rather than guessing a substrate. The routing layer (`tracks`) lets the
+/// trace-width DRC rule reason over the copper realizing each net.
 pub struct VerificationContext<'a> {
     pub requirements: &'a [Requirement],
     pub constraints: &'a [Constraint],
@@ -112,6 +113,7 @@ pub struct VerificationContext<'a> {
     pub bom_line_items: &'a [BomLineItem],
     pub board: Option<&'a Board>,
     pub placements: &'a [Placement],
+    pub tracks: &'a [Track],
 }
 
 /// A problem a rule detected. Not yet a domain `Violation` — the runtime mints that at the
@@ -612,10 +614,78 @@ impl Rule for DrcCourtyardOverlapRule {
     }
 }
 
+/// DRC rule: every routed [`Track`]'s copper `width` must be at least the design's minimum
+/// manufacturable trace width — the fabrication process floor. The floor is read from the
+/// first length-dimensioned target on a [`Regulatory`](RequirementCategory::Regulatory)
+/// requirement (a process/standards constraint, e.g. an IPC trace-width class), mirroring how
+/// floor planning takes the board edge from the first Mechanical length target. A trace finer
+/// than the floor cannot be etched by the chosen process, so it is an Error. With no such
+/// requirement there is no stated process floor, so the rule emits nothing rather than guessing
+/// one — a design that has not pinned a process is not spuriously failed. Comparisons are on
+/// the SI axis via `si_magnitude()` so the check is unit-independent (P9); tracks are scanned in
+/// slice order for determinism.
+pub struct DrcTraceWidthRule;
+
+impl DrcTraceWidthRule {
+    pub const ID: &'static str = "drc-trace-width";
+
+    pub fn new() -> Self {
+        Self
+    }
+}
+impl Default for DrcTraceWidthRule {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Rule for DrcTraceWidthRule {
+    fn id(&self) -> &str {
+        Self::ID
+    }
+
+    fn evaluate(&self, ctx: &VerificationContext) -> Vec<ViolationFinding> {
+        // The process floor: the first length-dimensioned target on a Regulatory requirement,
+        // in commit order. Absent one, there is no floor to check against.
+        let Some(floor) = ctx
+            .requirements
+            .iter()
+            .filter(|r| r.category == RequirementCategory::Regulatory)
+            .flat_map(|r| r.targets.iter())
+            .find(|t| t.dimension() == Dimension::Length)
+        else {
+            return Vec::new();
+        };
+        let floor_si = floor.si_magnitude();
+        let mut findings = Vec::new();
+        for track in ctx.tracks.iter() {
+            let width_si = track.width.si_magnitude();
+            // Below the floor by more than an epsilon, so a width that merely equals the floor
+            // (floating-point) is never a false violation. `scale` clamps to 1 m, and trace
+            // widths are sub-millimetre, so in practice this is an absolute ~1 nm tolerance.
+            let scale = width_si.abs().max(floor_si.abs()).max(1.0);
+            if floor_si - width_si > 1e-9 * scale {
+                findings.push(ViolationFinding {
+                    rule: Self::ID.to_string(),
+                    severity: ViolationSeverity::Error,
+                    subjects: vec![track.id],
+                    message: format!(
+                        "track {} width {} is finer than the {} process floor",
+                        track.id.short(),
+                        track.width,
+                        floor
+                    ),
+                });
+            }
+        }
+        findings
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eak_domain::{BoardSide, ConstraintStatus};
+    use eak_domain::{BoardSide, ConstraintStatus, Priority, RequirementStatus};
     use eak_units::Unit;
 
     #[test]
@@ -699,6 +769,7 @@ mod tests {
             bom_line_items: &[],
             board: None,
             placements: &[],
+            tracks: &[],
         };
         let findings = rule.evaluate(&ctx);
         assert_eq!(findings.len(), 1);
@@ -726,6 +797,7 @@ mod tests {
             bom_line_items: &[],
             board: None,
             placements: &[],
+            tracks: &[],
         });
         assert_eq!(findings.len(), 1);
     }
@@ -746,6 +818,7 @@ mod tests {
             bom_line_items: &[],
             board: None,
             placements: &[],
+            tracks: &[],
         });
         assert!(findings.is_empty());
     }
@@ -781,6 +854,7 @@ mod tests {
             bom_line_items: &[],
             board: None,
             placements: &[],
+            tracks: &[],
         }
     }
 
@@ -885,6 +959,7 @@ mod tests {
             bom_line_items,
             board: None,
             placements: &[],
+            tracks: &[],
         }
     }
 
@@ -1002,6 +1077,7 @@ mod tests {
             bom_line_items: &[],
             board,
             placements,
+            tracks: &[],
         }
     }
 
@@ -1074,5 +1150,85 @@ mod tests {
         ];
         let findings = DrcCourtyardOverlapRule::new().evaluate(&drc_ctx(None, &placements));
         assert_eq!(findings.len(), 1);
+    }
+
+    // ------------------------------ trace-width rule tests ------------------------------
+
+    /// A Regulatory requirement carrying a length target — the fabrication process floor the
+    /// trace-width rule reads.
+    fn process_floor_req(min_mm: f64) -> Requirement {
+        Requirement {
+            id: EntityId(700),
+            statement: format!("Fabrication process supports a {min_mm} mm minimum trace width"),
+            category: RequirementCategory::Regulatory,
+            priority: Priority::High,
+            acceptance_criterion: "all traces meet the process minimum".into(),
+            status: RequirementStatus::Accepted,
+            source: EntityId(1),
+            targets: vec![mm(min_mm)],
+        }
+    }
+
+    fn track(id: u128, width_mm: f64) -> Track {
+        Track {
+            id: EntityId(id),
+            net: EntityId(900 + id),
+            layer: BoardSide::Top,
+            width: mm(width_mm),
+            x1: mm(1.0),
+            y1: mm(1.0),
+            x2: mm(9.0),
+            y2: mm(1.0),
+        }
+    }
+
+    fn trace_ctx<'a>(
+        requirements: &'a [Requirement],
+        tracks: &'a [Track],
+    ) -> VerificationContext<'a> {
+        VerificationContext {
+            requirements,
+            constraints: &[],
+            components: &[],
+            pins: &[],
+            nets: &[],
+            parts: &[],
+            bom_line_items: &[],
+            board: None,
+            placements: &[],
+            tracks,
+        }
+    }
+
+    #[test]
+    fn trace_finer_than_floor_is_flagged() {
+        // A 0.25 mm trace cannot be etched by a 0.5 mm process.
+        let reqs = vec![process_floor_req(0.5)];
+        let tracks = vec![track(10, 0.25)];
+        let findings = DrcTraceWidthRule::new().evaluate(&trace_ctx(&reqs, &tracks));
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule, DrcTraceWidthRule::ID);
+        assert_eq!(findings[0].severity, ViolationSeverity::Error);
+        assert_eq!(findings[0].subjects, vec![EntityId(10)]);
+    }
+
+    #[test]
+    fn trace_meeting_floor_passes() {
+        // A trace exactly at the floor (and one above it) is manufacturable.
+        let reqs = vec![process_floor_req(0.25)];
+        let tracks = vec![track(10, 0.25), track(11, 0.40)];
+        assert!(DrcTraceWidthRule::new()
+            .evaluate(&trace_ctx(&reqs, &tracks))
+            .is_empty());
+    }
+
+    #[test]
+    fn trace_width_is_silent_without_a_process_floor() {
+        // No Regulatory length target: the process floor is unstated, so even a hair-thin trace
+        // is not flagged rather than guessing a floor.
+        let tracks = vec![track(10, 0.05)];
+        assert!(DrcTraceWidthRule::new()
+            .evaluate(&trace_ctx(&[], &tracks))
+            .is_empty());
     }
 }

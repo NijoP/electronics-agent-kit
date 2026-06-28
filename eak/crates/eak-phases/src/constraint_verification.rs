@@ -67,6 +67,7 @@ impl Machine for ConstraintVerificationMachine {
                 // verification phases.
                 let board = ctx.board();
                 let placements = ctx.placements();
+                let tracks = ctx.tracks();
                 let findings = engine.run(&VerificationContext {
                     requirements: &requirements,
                     constraints: &constraints,
@@ -77,6 +78,7 @@ impl Machine for ConstraintVerificationMachine {
                     bom_line_items: &bom_line_items,
                     board: board.as_ref(),
                     placements: &placements,
+                    tracks: &tracks,
                 });
 
                 let existing = ctx.violations();

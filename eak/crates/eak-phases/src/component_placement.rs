@@ -146,12 +146,13 @@ fn project_pcb(ctx: &mut dyn AgentContext) -> Result<PcbIr, MachineError> {
     let nets = ctx.nets();
     let board = ctx.board();
     let placements = ctx.placements();
+    let tracks = ctx.tracks();
     let req_ir = RequirementIr::project(&intent, &reqs, &links)
         .map_err(|e| MachineError::Internal(e.to_string()))?;
     let eng_ir = EngineeringIr::project(&req_ir, &blocks, &constraints)
         .map_err(|e| MachineError::Internal(e.to_string()))?;
     let sch_ir = SchematicIr::project(&eng_ir, &components, &pins, &nets)
         .map_err(|e| MachineError::Internal(e.to_string()))?;
-    PcbIr::project(&sch_ir, board.as_ref(), &placements)
+    PcbIr::project(&sch_ir, board.as_ref(), &placements, &tracks)
         .map_err(|e| MachineError::Internal(e.to_string()))
 }

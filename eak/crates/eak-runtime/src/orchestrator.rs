@@ -132,7 +132,7 @@ mod tests {
     use crate::protocol::{Autonomy, CapabilityAck, CapabilityError, CapabilityRequest};
     use eak_domain::{
         Board, BomLineItem, Component, Constraint, DesignIntent, EntityId, FunctionalBlock, Net,
-        Part, Pin, Placement, ProvenanceLink, Requirement, Violation,
+        Part, Pin, Placement, ProvenanceLink, Requirement, Track, Violation,
     };
     use eak_ports::{Event, ReasoningError, ReasoningRequest, ReasoningResponse, Seq, StoreError};
 
@@ -186,6 +186,9 @@ mod tests {
             None
         }
         fn placements(&self) -> Vec<Placement> {
+            vec![]
+        }
+        fn tracks(&self) -> Vec<Track> {
             vec![]
         }
         fn reason(

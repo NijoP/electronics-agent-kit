@@ -10,7 +10,8 @@ use crate::protocol::{AgentContext, Autonomy, CapabilityAck, CapabilityError, Ca
 use crate::state::EngineeringState;
 use eak_domain::{
     Board, BomLineItem, Component, Constraint, Decision, DesignIntent, EntityId, Evidence,
-    FunctionalBlock, Net, Part, Pin, Placement, ProvenanceLink, Requirement, Violation, Waiver,
+    FunctionalBlock, Net, Part, Pin, Placement, ProvenanceLink, Requirement, Track, Violation,
+    Waiver,
 };
 use eak_ports::{
     Event, EventLog, ReasoningEngine, ReasoningError, ReasoningRequest, ReasoningResponse, Seq,
@@ -463,6 +464,51 @@ impl RuntimeCore {
             .map_err(|e| CapabilityError::Rejected(e.to_string()))?;
         Ok(CapabilityAck { committed: seqs })
     }
+
+    fn handle_route_net(
+        &mut self,
+        track: Track,
+        links: Vec<ProvenanceLink>,
+    ) -> Result<CapabilityAck, CapabilityError> {
+        // The seam (P3): re-validate the trace (positive width, finite endpoints) before
+        // committing.
+        track
+            .validate()
+            .map_err(|e| CapabilityError::Rejected(e.to_string()))?;
+        // A track that realizes no net is untraceable to the schematic (P3) — reject it.
+        if track.net.is_null() {
+            return Err(CapabilityError::Rejected("track realizes no net".into()));
+        }
+        // Referential integrity at the seam: the realized net must be committed, so a track can
+        // never realize a phantom net (P3, P5).
+        if self.state.net(track.net).is_none() {
+            return Err(CapabilityError::Rejected(format!(
+                "track realizes unknown net {}",
+                track.net.short()
+            )));
+        }
+        // A track is copper on a substrate — require the board first, so routing can never
+        // precede the floor plan (P5).
+        if self.state.board.is_none() {
+            return Err(CapabilityError::Rejected(
+                "cannot route a net before the board outline exists".into(),
+            ));
+        }
+        // Single-realization: a net is realized by exactly one track, so a second track for the
+        // same net would contradict net-realization completeness — reject it (P5).
+        if self.state.tracks.iter().any(|t| t.net == track.net) {
+            return Err(CapabilityError::Rejected("net is already routed".into()));
+        }
+
+        let mut events = vec![Event::TrackCommitted { track }];
+        for link in links {
+            events.push(Event::ProvenanceLinked { link });
+        }
+        let seqs = self
+            .commit(events)
+            .map_err(|e| CapabilityError::Rejected(e.to_string()))?;
+        Ok(CapabilityAck { committed: seqs })
+    }
 }
 
 impl AgentContext for RuntimeCore {
@@ -526,6 +572,10 @@ impl AgentContext for RuntimeCore {
         self.state.placements.clone()
     }
 
+    fn tracks(&self) -> Vec<Track> {
+        self.state.tracks.clone()
+    }
+
     fn reason(
         &mut self,
         mut req: ReasoningRequest,
@@ -577,6 +627,7 @@ impl AgentContext for RuntimeCore {
             CapabilityRequest::PlaceComponent { placement, links } => {
                 self.handle_place_component(placement, links)
             }
+            CapabilityRequest::RouteNet { track, links } => self.handle_route_net(track, links),
         }
     }
 
