@@ -100,6 +100,8 @@ pub enum Event {
     },
     VerificationCompleted {
         rule_count: usize,
+        /// Open, blocking violations scoped to *this phase's own rules* (not the global
+        /// violation count). Audit-only — not folded into `EngineeringState`.
         open_violations: usize,
     },
 

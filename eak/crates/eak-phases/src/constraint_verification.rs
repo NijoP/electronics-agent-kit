@@ -119,8 +119,12 @@ impl Machine for ConstraintVerificationMachine {
                         .map_err(|e| MachineError::Internal(e.to_string()))?;
                 }
 
-                // Re-read after raising so the milestone reflects committed state.
-                let open_blocking = ctx.violations().iter().filter(|v| v.is_blocking()).count();
+                // Re-read after raising so the gate reflects committed state. The phase fails on
+                // ITS OWN open, blocking findings only (`count_open_blocking` scopes to this
+                // engine's rules) — an open violation from a different rule-check phase, e.g. a
+                // DFM violation seen while DRC re-runs on a DFM loop-back, is the Manufacturing
+                // gate's concern, not this phase's.
+                let open_blocking = engine.count_open_blocking(&ctx.violations());
                 ctx.emit(vec![Event::VerificationCompleted {
                     rule_count: engine.rule_count(),
                     open_violations: open_blocking,

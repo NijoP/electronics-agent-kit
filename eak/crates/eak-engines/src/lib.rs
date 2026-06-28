@@ -8,7 +8,7 @@
 use eak_domain::{
     Board, BomLineItem, Component, ComponentClass, Constraint, ConstraintKind, EntityId, Net,
     NetClass, Part, PartLifecycle, Pin, PinElectricalType, Placement, Requirement,
-    RequirementCategory, Track, ViolationSeverity,
+    RequirementCategory, Track, Violation, ViolationSeverity,
 };
 use eak_units::{Dimension, PhysicalQuantity, UnitError};
 use std::cmp::Ordering;
@@ -158,6 +158,27 @@ impl VerificationEngine {
 
     pub fn rule_count(&self) -> usize {
         self.rules.len()
+    }
+
+    /// The ids of the registered rules. A verification phase uses this to scope its pass/fail
+    /// gate to *its own* findings: a phase fails iff one of ITS rules has an open, blocking
+    /// violation — not iff any violation anywhere is open. (The global "all violations clear"
+    /// check belongs to the Manufacturing gate, which spans every rule-check phase.)
+    pub fn rule_ids(&self) -> Vec<&str> {
+        self.rules.iter().map(|r| r.id()).collect()
+    }
+
+    /// Count the OPEN, blocking violations that belong to THIS engine's rules — the per-phase
+    /// gate. Scoping to the engine's own rule ids (rather than the global violation set) keeps a
+    /// phase's pass/fail about its own checks: a violation raised by a *different* rule-check
+    /// phase — e.g. a DFM violation still open while DRC re-runs on a DFM loop-back — must not
+    /// fail this phase. The cross-phase "all violations clear" check is the Manufacturing gate.
+    pub fn count_open_blocking(&self, violations: &[Violation]) -> usize {
+        let ids = self.rule_ids();
+        violations
+            .iter()
+            .filter(|v| v.is_blocking() && ids.contains(&v.rule.as_str()))
+            .count()
     }
 
     /// Evaluate every rule and return all findings.
@@ -674,6 +695,127 @@ impl Rule for DrcTraceWidthRule {
                         track.id.short(),
                         track.width,
                         floor
+                    ),
+                });
+            }
+        }
+        findings
+    }
+}
+
+// ================================== DFM Rules ==================================
+
+/// The fabrication/assembly keep-out band from the board edge, in millimetres. Component
+/// bodies and copper inside this band foul pick-and-place and are nicked during
+/// depanelization, so a design that merely *fits* the outline can still be unmanufacturable. A
+/// fixed process constant in Phase-3 scope (a real flow derives it from the fab/assembly
+/// class); kept below the placement margin so a normally-placed design clears it.
+const DFM_EDGE_CLEARANCE_MM: f64 = 0.5;
+
+/// DFM rule: every [`Placement`]'s courtyard must keep at least [`DFM_EDGE_CLEARANCE_MM`] from
+/// the [`Board`] edge. Distinct from [`DrcOutOfBoundsRule`], which only requires the courtyard
+/// to *fit*: this demands an assembly keep-out band, so a component that fits but hugs the edge
+/// is a manufacturability Error. Comparisons are on the SI axis via `si_magnitude()` (P9); with
+/// no board there is no edge to measure from, so the rule emits nothing. Placements are scanned
+/// in slice order for determinism.
+pub struct DfmEdgeClearanceRule;
+
+impl DfmEdgeClearanceRule {
+    pub const ID: &'static str = "dfm-edge-clearance";
+
+    pub fn new() -> Self {
+        Self
+    }
+}
+impl Default for DfmEdgeClearanceRule {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Rule for DfmEdgeClearanceRule {
+    fn id(&self) -> &str {
+        Self::ID
+    }
+
+    fn evaluate(&self, ctx: &VerificationContext) -> Vec<ViolationFinding> {
+        let Some(board) = ctx.board else {
+            return Vec::new();
+        };
+        let (board_w, board_h) = (board.width.si_magnitude(), board.height.si_magnitude());
+        let m = DFM_EDGE_CLEARANCE_MM * 1e-3; // millimetres -> metres (SI)
+        let mut findings = Vec::new();
+        for placement in ctx.placements.iter() {
+            let x = placement.x.si_magnitude();
+            let y = placement.y.si_magnitude();
+            let w = placement.width.si_magnitude();
+            let h = placement.height.si_magnitude();
+            if x < m || y < m || x + w > board_w - m || y + h > board_h - m {
+                findings.push(ViolationFinding {
+                    rule: Self::ID.to_string(),
+                    severity: ViolationSeverity::Error,
+                    subjects: vec![placement.id],
+                    message: format!(
+                        "placement {} is within the {} mm board-edge keep-out",
+                        placement.id.short(),
+                        DFM_EDGE_CLEARANCE_MM
+                    ),
+                });
+            }
+        }
+        findings
+    }
+}
+
+/// DFM rule: every [`Track`]'s copper must keep at least [`DFM_EDGE_CLEARANCE_MM`] from the
+/// [`Board`] edge — edge copper is nicked during depanelization. The keep-out is four
+/// axis-aligned edge bands. Because `x` and `y` vary linearly along a straight segment, the
+/// copper band's extreme reach in each axis (the centre-line extreme ± half the width) occurs at
+/// an endpoint; checking both endpoints' `±half` against the four bands is therefore exact for a
+/// straight trace (no need to sample interior points). With no board the rule emits nothing.
+/// Tracks are scanned in slice order for determinism.
+pub struct DfmTraceEdgeClearanceRule;
+
+impl DfmTraceEdgeClearanceRule {
+    pub const ID: &'static str = "dfm-trace-edge-clearance";
+
+    pub fn new() -> Self {
+        Self
+    }
+}
+impl Default for DfmTraceEdgeClearanceRule {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Rule for DfmTraceEdgeClearanceRule {
+    fn id(&self) -> &str {
+        Self::ID
+    }
+
+    fn evaluate(&self, ctx: &VerificationContext) -> Vec<ViolationFinding> {
+        let Some(board) = ctx.board else {
+            return Vec::new();
+        };
+        let (board_w, board_h) = (board.width.si_magnitude(), board.height.si_magnitude());
+        let m = DFM_EDGE_CLEARANCE_MM * 1e-3; // millimetres -> metres (SI)
+        let mut findings = Vec::new();
+        for track in ctx.tracks.iter() {
+            let half = track.width.si_magnitude() / 2.0;
+            let xs = [track.x1.si_magnitude(), track.x2.si_magnitude()];
+            let ys = [track.y1.si_magnitude(), track.y2.si_magnitude()];
+            let too_close = xs.iter().any(|&x| x - half < m || x + half > board_w - m)
+                || ys.iter().any(|&y| y - half < m || y + half > board_h - m);
+            if too_close {
+                findings.push(ViolationFinding {
+                    rule: Self::ID.to_string(),
+                    severity: ViolationSeverity::Error,
+                    subjects: vec![track.id],
+                    message: format!(
+                        "track {} copper is within the {} mm board-edge keep-out",
+                        track.id.short(),
+                        DFM_EDGE_CLEARANCE_MM
                     ),
                 });
             }
@@ -1229,6 +1371,102 @@ mod tests {
         let tracks = vec![track(10, 0.05)];
         assert!(DrcTraceWidthRule::new()
             .evaluate(&trace_ctx(&[], &tracks))
+            .is_empty());
+    }
+
+    // -------------------------------- DFM rule tests --------------------------------
+
+    fn edge_track(id: u128, x1: f64, y1: f64, x2: f64, y2: f64, width: f64) -> Track {
+        Track {
+            id: EntityId(id),
+            net: EntityId(900 + id),
+            layer: BoardSide::Top,
+            width: mm(width),
+            x1: mm(x1),
+            y1: mm(y1),
+            x2: mm(x2),
+            y2: mm(y2),
+        }
+    }
+
+    fn dfm_track_ctx<'a>(board: Option<&'a Board>, tracks: &'a [Track]) -> VerificationContext<'a> {
+        VerificationContext {
+            requirements: &[],
+            constraints: &[],
+            components: &[],
+            pins: &[],
+            nets: &[],
+            parts: &[],
+            bom_line_items: &[],
+            board,
+            placements: &[],
+            tracks,
+        }
+    }
+
+    #[test]
+    fn placement_well_inside_passes_dfm_edge_clearance() {
+        let b = board(1, 100.0, 80.0);
+        // Courtyard [10,30] x [10,30] is far from every edge (keep-out is 0.5 mm).
+        let placements = vec![placement(10, 900, 10.0, 10.0, 20.0, 20.0, BoardSide::Top)];
+        assert!(DfmEdgeClearanceRule::new()
+            .evaluate(&drc_ctx(Some(&b), &placements))
+            .is_empty());
+    }
+
+    #[test]
+    fn placement_hugging_edge_is_flagged_but_still_fits() {
+        let b = board(1, 100.0, 80.0);
+        // x + width = 79.9 + 20 = 99.9: inside the 100 mm outline (so DRC out-of-bounds passes),
+        // but only 0.1 mm from the right edge — inside the 0.5 mm assembly keep-out.
+        let placements = vec![placement(10, 900, 79.9, 10.0, 20.0, 20.0, BoardSide::Top)];
+        assert!(DrcOutOfBoundsRule::new()
+            .evaluate(&drc_ctx(Some(&b), &placements))
+            .is_empty());
+        let findings = DfmEdgeClearanceRule::new().evaluate(&drc_ctx(Some(&b), &placements));
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule, DfmEdgeClearanceRule::ID);
+        assert_eq!(findings[0].severity, ViolationSeverity::Error);
+        assert_eq!(findings[0].subjects, vec![EntityId(10)]);
+    }
+
+    #[test]
+    fn edge_clearance_yields_no_findings_without_a_board() {
+        // No outline: there is no edge to measure a keep-out from, so the rule stays silent.
+        let placements = vec![placement(10, 900, 0.0, 0.0, 20.0, 20.0, BoardSide::Top)];
+        assert!(DfmEdgeClearanceRule::new()
+            .evaluate(&drc_ctx(None, &placements))
+            .is_empty());
+    }
+
+    #[test]
+    fn trace_well_inside_passes_dfm_edge_clearance() {
+        let b = board(1, 100.0, 80.0);
+        // A horizontal trace from (10,40) to (90,40), 0.25 mm wide: comfortably inside.
+        let tracks = vec![edge_track(10, 10.0, 40.0, 90.0, 40.0, 0.25)];
+        assert!(DfmTraceEdgeClearanceRule::new()
+            .evaluate(&dfm_track_ctx(Some(&b), &tracks))
+            .is_empty());
+    }
+
+    #[test]
+    fn trace_copper_hugging_edge_is_flagged() {
+        let b = board(1, 100.0, 80.0);
+        // An endpoint at x = 0.2 mm with a 0.25 mm trace puts the copper edge at 0.075 mm —
+        // inside the 0.5 mm board-edge keep-out.
+        let tracks = vec![edge_track(10, 0.2, 40.0, 90.0, 40.0, 0.25)];
+        let findings = DfmTraceEdgeClearanceRule::new().evaluate(&dfm_track_ctx(Some(&b), &tracks));
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule, DfmTraceEdgeClearanceRule::ID);
+        assert_eq!(findings[0].severity, ViolationSeverity::Error);
+        assert_eq!(findings[0].subjects, vec![EntityId(10)]);
+    }
+
+    #[test]
+    fn trace_edge_clearance_yields_no_findings_without_a_board() {
+        let tracks = vec![edge_track(10, 0.1, 0.1, 90.0, 0.1, 0.25)];
+        assert!(DfmTraceEdgeClearanceRule::new()
+            .evaluate(&dfm_track_ctx(None, &tracks))
             .is_empty());
     }
 }

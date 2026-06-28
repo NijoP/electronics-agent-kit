@@ -1,17 +1,19 @@
-//! End-to-end verification of the Phase-3 exit criteria over the full 12-phase workflow:
+//! End-to-end verification of the Phase-3 exit criteria over the full 13-phase workflow:
 //! Requirement Planning -> Engineering Analysis -> Constraint Extraction -> Constraint
 //! Verification -> Schematic Planning -> ERC Verification -> BOM Planning -> BOM Verification
-//! -> PCB Floor Planning -> Component Placement -> Routing Planning -> DRC Verification. A
-//! consistent, realizable design runs all twelve phases clean and lands a placed, routed board.
-//! Five kinds of fault are each caught at their gate, routed back automatically, and left fully
-//! traceable to their cause: an infeasible constraint pair (Constraint Verification), an
-//! electrically-invalid power net with consumers but no driver (ERC), a procurement fault — an
-//! end-of-life catalog part — at the BOM lifecycle gate, a courtyard that runs off an undersized
-//! board outline (DRC out-of-bounds), and a trace finer than the fabrication process floor (DRC
-//! trace-width). The first three faults stop the workflow before any of the PCB phases run; the
-//! two DRC faults are the last gate, which loops back to Routing Planning. The Phase-1/2
-//! guarantees (multi-phase orchestration, full requirement traceability, the correctness loops,
-//! byte-identical replay) still hold over the larger workflow.
+//! -> PCB Floor Planning -> Component Placement -> Routing Planning -> DRC Verification -> DFM
+//! Verification. A consistent, realizable design runs all thirteen phases clean and lands a
+//! placed, routed, manufacturable board. Six kinds of fault are each caught at their gate,
+//! routed back automatically, and left fully traceable to their cause: an infeasible constraint
+//! pair (Constraint Verification), an electrically-invalid power net with consumers but no
+//! driver (ERC), a procurement fault — an end-of-life catalog part — at the BOM lifecycle gate,
+//! a courtyard that runs off an undersized board outline (DRC out-of-bounds), a trace finer than
+//! the fabrication process floor (DRC trace-width), and a component inside the board-edge
+//! keep-out (DFM edge-clearance). The first three faults stop the workflow before any of the PCB
+//! phases run; the DRC faults loop back to Routing Planning, and the DFM fault loops back to
+//! Component Placement. The Phase-1/2 guarantees (multi-phase orchestration, full requirement
+//! traceability, the correctness loops, byte-identical replay) still hold over the larger
+//! workflow.
 
 use eak_cli::{
     replay_cmd, run, run_with, trace_cmd, PhaseOutcome, ReasoningChoice, Relation, RunConfig,
@@ -240,16 +242,60 @@ fn trace_floor_engine() -> Box<dyn ReasoningEngine> {
     }))
 }
 
+/// A reasoning engine for the DFM edge-clearance scenario: a USB-C power-entry connector, an
+/// enclosure that sizes the board to a 32.3 mm square, and one electrical load. The three
+/// components lay out at x = 2, 14, 26 mm; the trailing courtyard ends at x = 32 mm, so it FITS
+/// the 32.3 mm outline (DRC out-of-bounds and trace-width are clean) but sits only 0.3 mm from
+/// the right edge — inside the 0.5 mm DFM board-edge keep-out. It is the one fault produced at
+/// the manufacturability gate rather than DRC.
+fn tight_edge_board_engine() -> Box<dyn ReasoningEngine> {
+    let usb_c = CandidateRequirement {
+        statement: "Device shall be powered over USB-C".into(),
+        category: RequirementCategory::Functional,
+        priority: Priority::High,
+        acceptance_criterion: "the device draws power through a USB-C receptacle".into(),
+        source_hint: "intent: USB-C power entry".into(),
+        confidence: 0.9,
+        rationale: "USB-C is the stated power interface".into(),
+        targets: vec![],
+    };
+    let enclosure = CandidateRequirement {
+        statement: "Enclosure limits the board to 32.3 x 32.3 mm".into(),
+        category: RequirementCategory::Mechanical,
+        priority: Priority::High,
+        acceptance_criterion: "the board outline fits within 32.3 x 32.3 mm".into(),
+        source_hint: "intent: enclosure".into(),
+        confidence: 0.9,
+        rationale: "the enclosure caps the usable board area".into(),
+        targets: vec![PhysicalQuantity::new(32.3, Unit::Millimetre)],
+    };
+    let load = CandidateRequirement {
+        statement: "Logic core shall operate at a 3.3 V logic level".into(),
+        category: RequirementCategory::Electrical,
+        priority: Priority::High,
+        acceptance_criterion: "core I/O is measured at a 3.3 V logic level".into(),
+        source_hint: "intent: logic core".into(),
+        confidence: 0.9,
+        rationale: "the digital core needs a defined logic level".into(),
+        targets: vec![],
+    };
+    Box::new(FixtureEngine::single(ReasoningResponse {
+        candidates: vec![usb_c, enclosure, load],
+        clarifying_questions: vec![],
+        raw: "{}".into(),
+    }))
+}
+
 #[test]
-fn run_replays_byte_identical_and_runs_twelve_phases() {
+fn run_replays_byte_identical_and_runs_thirteen_phases() {
     let (config, log) = cfg("det", 1);
     let report = run(&config).expect("run succeeds");
 
     // Full Phase-3 workflow on a consistent, realizable design: RP -> Engineering Analysis ->
     // Constraint Extraction -> Constraint Verification -> Schematic Planning -> ERC -> BOM
     // Planning -> BOM Verification -> PCB Floor Planning -> Component Placement -> Routing
-    // Planning -> DRC, all OK.
-    assert_eq!(report.outcomes.len(), 12);
+    // Planning -> DRC -> DFM, all OK.
+    assert_eq!(report.outcomes.len(), 13);
     assert!(report
         .outcomes
         .iter()
@@ -820,6 +866,127 @@ fn routing_trace_too_fine_is_caught_routed_back_and_left_traceable() {
     }
 
     // Replay identity holds even for a failed, looped-back routing run.
+    let replayed = replay_cmd(&log).expect("replay succeeds");
+    assert_eq!(report.state, replayed);
+    assert_eq!(report.state.canonical_json(), replayed.canonical_json());
+
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
+fn dfm_edge_too_close_is_caught_routed_back_and_left_traceable() {
+    let (config, log) = cfg("dfm", 15);
+    let report =
+        run_with(tight_edge_board_engine(), &config).expect("run completes with a failure");
+
+    // The DFM correctness loop fired: DFM failed and was routed back to Component Placement (the
+    // canonical target — manufacturability defects are usually placement-driven), bounded to
+    // 1 initial + 2 retries = 3 DFM runs, every one failing.
+    let dfm_runs: Vec<&PhaseOutcome> = report
+        .outcomes
+        .iter()
+        .filter(|(n, _)| n == "DfmVerification")
+        .map(|(_, o)| o)
+        .collect();
+    assert_eq!(dfm_runs.len(), 3);
+    assert!(dfm_runs
+        .iter()
+        .all(|o| matches!(o, PhaseOutcome::Failed(_))));
+
+    // Component Placement re-ran on each loop-back (idempotent): 1 initial + 2 re-entries.
+    let placement_runs = report
+        .outcomes
+        .iter()
+        .filter(|(n, _)| n == "ComponentPlacement")
+        .count();
+    assert_eq!(placement_runs, 3);
+
+    // DRC ran clean upstream every time — the layout fits and the traces are clear; DFM is the
+    // only gate that fails.
+    assert!(report
+        .outcomes
+        .iter()
+        .filter(|(n, _)| n == "DrcVerification")
+        .all(|(_, o)| matches!(o, PhaseOutcome::Success)));
+    assert!(report.state.board.is_some());
+    assert_eq!(report.state.placements.len(), 3);
+
+    // The workflow did not reach a clean end: its final phase is the failed DFM gate.
+    let (last_name, last_outcome) = report.outcomes.last().expect("at least one phase ran");
+    assert_eq!(last_name, "DfmVerification");
+    assert!(matches!(last_outcome, PhaseOutcome::Failed(_)));
+
+    // Exactly one OPEN, blocking, error-severity violation from the edge-clearance rule
+    // (loop-back re-verification never double-raised it): the lone edge-hugging courtyard.
+    let edge: Vec<_> = report
+        .state
+        .violations
+        .iter()
+        .filter(|v| v.rule == "dfm-edge-clearance")
+        .collect();
+    assert_eq!(edge.len(), 1);
+    let v = edge[0];
+    assert_eq!(v.status, ViolationStatus::Open);
+    assert_eq!(v.severity, ViolationSeverity::Error);
+    assert!(v.is_blocking());
+    assert_eq!(
+        report.state.open_blocking_violations().len(),
+        1,
+        "the edge-hugging courtyard is the only blocking violation"
+    );
+
+    // FULLY TRACEABLE across the PCB layer: the violation names a placement; walk
+    // placement -> component -> functional block -> requirement -> design intent, checking the
+    // backing provenance link at each synthesized hop.
+    let intent = report.state.intent.as_ref().expect("intent captured");
+    assert_eq!(v.subjects.len(), 1, "one edge-hugging placement implicated");
+    let pid = v.subjects[0];
+
+    // Violation -> Placement (TracesTo), raised by DFM.
+    assert!(report
+        .state
+        .links
+        .iter()
+        .any(|l| l.from == v.id && l.to == pid && l.relation == Relation::TracesTo));
+
+    let placement = report
+        .state
+        .placement(pid)
+        .expect("violation subject is a known placement");
+    let component = report
+        .state
+        .component(placement.component)
+        .expect("placement positions a known component");
+
+    // Placement -> Component (TracesTo), recorded by Component Placement.
+    assert!(report
+        .state
+        .links
+        .iter()
+        .any(|l| l.from == pid && l.to == component.id && l.relation == Relation::TracesTo));
+
+    let block = report
+        .state
+        .functional_block(component.from_block)
+        .expect("component was realized from a known block");
+    assert!(
+        !block.requirements.is_empty(),
+        "block realizes a requirement"
+    );
+    for req_id in &block.requirements {
+        let req = report
+            .state
+            .requirement(*req_id)
+            .expect("block realizes a known requirement");
+        assert_eq!(req.source, intent.id);
+        assert!(report
+            .state
+            .links
+            .iter()
+            .any(|l| l.from == block.id && l.to == req.id && l.relation == Relation::DerivedFrom));
+    }
+
+    // Replay identity holds even for a failed, looped-back DFM run.
     let replayed = replay_cmd(&log).expect("replay succeeds");
     assert_eq!(report.state, replayed);
     assert_eq!(report.state.canonical_json(), replayed.canonical_json());

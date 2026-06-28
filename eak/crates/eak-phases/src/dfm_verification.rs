@@ -1,47 +1,51 @@
-//! BOM Verification state machine (instance) — the gate of the BOM correctness loop.
+//! DFM Verification state machine (instance) — the design-for-manufacturability gate.
 //!
-//! Structurally a sibling of [`ErcVerificationMachine`](crate::ErcVerificationMachine), but its
-//! [`VerificationEngine`] is loaded with the BOM rules ([`BomCoverageRule`],
-//! [`BomLifecycleRule`]) and it runs them over the realized schematic plus its bill of
-//! materials (parts, line items). Each *new* finding becomes a first-class [`Violation`] linked
-//! back to the subject(s) it implicates so it is fully traceable to its cause (P3), and the
+//! Structurally a sibling of [`DrcVerificationMachine`](crate::DrcVerificationMachine), but its
+//! [`VerificationEngine`] is loaded with the manufacturability rules
+//! ([`DfmEdgeClearanceRule`], [`DfmTraceEdgeClearanceRule`]) and it runs them over the physical
+//! layer (the board outline, its placements, and the routed tracks). It runs only after DRC
+//! passes. Each *new* finding becomes a first-class [`Violation`] linked back to the
+//! placement(s) or track(s) it implicates so it is fully traceable to its cause (P3), and the
 //! [`Event::VerificationCompleted`] milestone is recorded. If any blocking (open,
-//! error-severity) violation remains — e.g. an end-of-life part — it reports
-//! [`StepResult::Failed`], which the orchestrator routes back to BOM Planning; otherwise the
-//! phase is [`StepResult::Done`]. Re-verification is idempotent — an already-raised violation
-//! (open OR waived) is never duplicated — so a waiver granted between passes lets the re-verify
-//! succeed. See `docs/state-machines/bom-verification.md`.
+//! error-severity) violation remains — e.g. a component inside the board-edge keep-out — it
+//! reports [`StepResult::Failed`], which the orchestrator routes back to Component Placement
+//! (manufacturability defects are usually placement-driven); otherwise the phase is
+//! [`StepResult::Done`]. Re-verification is idempotent — an already-raised violation (open OR
+//! waived) is never duplicated — so a waiver granted between passes lets the re-verify succeed.
+//! See `docs/state-machines/dfm-verification.md`.
 
 use eak_domain::{ProvenanceLink, RelationType, Violation, ViolationStatus};
-use eak_engines::{BomCoverageRule, BomLifecycleRule, VerificationContext, VerificationEngine};
+use eak_engines::{
+    DfmEdgeClearanceRule, DfmTraceEdgeClearanceRule, VerificationContext, VerificationEngine,
+};
 use eak_ports::Event;
 use eak_runtime::{AgentContext, CapabilityRequest, Machine, MachineError, StepResult};
 
-pub struct BomVerificationMachine;
+pub struct DfmVerificationMachine;
 
-impl BomVerificationMachine {
+impl DfmVerificationMachine {
     pub fn new() -> Self {
         Self
     }
 
-    /// The verification engine for this phase: the two Phase-3 BOM rules registered against
-    /// the same generic framework that Constraint and ERC Verification use (reuse: one
+    /// The verification engine for this phase: the two Phase-3 DFM rules registered against the
+    /// same generic framework that Constraint, ERC, BOM, and DRC Verification use (reuse: one
     /// framework, many checks).
     fn engine() -> VerificationEngine {
         VerificationEngine::new()
-            .with_rule(Box::new(BomCoverageRule::new()))
-            .with_rule(Box::new(BomLifecycleRule::new()))
+            .with_rule(Box::new(DfmEdgeClearanceRule::new()))
+            .with_rule(Box::new(DfmTraceEdgeClearanceRule::new()))
     }
 }
-impl Default for BomVerificationMachine {
+impl Default for DfmVerificationMachine {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Machine for BomVerificationMachine {
+impl Machine for DfmVerificationMachine {
     fn name(&self) -> &str {
-        "BomVerification"
+        "DfmVerification"
     }
 
     fn initial(&self) -> String {
@@ -65,9 +69,8 @@ impl Machine for BomVerificationMachine {
                 let nets = ctx.nets();
                 let parts = ctx.parts();
                 let bom_line_items = ctx.bom_line_items();
-                // The PCB layer is empty at this phase (the floor plan comes later); binding the
-                // owned board/placements to locals keeps the engine's context uniform across all
-                // verification phases.
+                // Bind the owned board/placements/tracks to locals so their borrows outlive the
+                // context the engine reasons over.
                 let board = ctx.board();
                 let placements = ctx.placements();
                 let tracks = ctx.tracks();
@@ -104,9 +107,11 @@ impl Machine for BomVerificationMachine {
                         message: finding.message.clone(),
                         status: ViolationStatus::Open,
                     };
-                    // Link the violation to each implicated subject (a component for coverage,
-                    // a line item for lifecycle); combined with the BOM's own TracesTo links
-                    // this completes the trace Violation -> LineItem/Component -> ... -> Intent.
+                    // Link the violation to each implicated subject — a placement (edge-clearance
+                    // rule) or a track (trace-edge rule). Combined with the subject's own TracesTo
+                    // links this completes the trace back to intent, e.g.
+                    // Violation -> Placement -> Component -> Block -> Requirement -> Intent, or
+                    // Violation -> Track -> Net -> ... -> Requirement -> Intent.
                     let links: Vec<ProvenanceLink> = finding
                         .subjects
                         .iter()

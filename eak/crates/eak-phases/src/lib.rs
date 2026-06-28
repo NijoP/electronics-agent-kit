@@ -7,6 +7,7 @@ pub mod bom_verification;
 pub mod component_placement;
 pub mod constraint_extraction;
 pub mod constraint_verification;
+pub mod dfm_verification;
 pub mod drc_verification;
 pub mod engineering_analysis;
 pub mod erc_verification;
@@ -21,6 +22,7 @@ pub use bom_verification::BomVerificationMachine;
 pub use component_placement::ComponentPlacementMachine;
 pub use constraint_extraction::ConstraintExtractionMachine;
 pub use constraint_verification::ConstraintVerificationMachine;
+pub use dfm_verification::DfmVerificationMachine;
 pub use drc_verification::DrcVerificationMachine;
 pub use engineering_analysis::EngineeringAnalysisMachine;
 pub use erc_verification::ErcVerificationMachine;
@@ -656,13 +658,15 @@ mod tests {
             Box::new(ComponentPlacementMachine::new()),
             Box::new(RoutingPlanningMachine::new()),
             Box::new(DrcVerificationMachine::new()),
+            Box::new(DfmVerificationMachine::new()),
         ]);
         let results = Orchestrator::new().run(&mut plan, &mut core);
 
-        assert_eq!(results.len(), 12);
+        assert_eq!(results.len(), 13);
         assert!(results.iter().all(|(_, o)| *o == PhaseOutcome::Success));
         // The PCB layer exists: an outline plus one placement per realized component, all
-        // within bounds and non-overlapping, so the placement DRC is clean.
+        // within bounds, non-overlapping, and clear of the board-edge keep-out, so both the
+        // placement DRC and the DFM gate are clean.
         assert!(core.state.board.is_some());
         assert!(!core.state.placements.is_empty());
         assert_eq!(core.state.placements.len(), core.state.components.len());
@@ -672,7 +676,7 @@ mod tests {
         assert_eq!(core.state.tracks.len(), core.state.nets.len());
         assert!(core.state.violations.is_empty());
 
-        // byte-identical replay holds across the whole 12-phase run.
+        // byte-identical replay holds across the whole 13-phase run.
         let replayed = replay(core.log()).unwrap();
         assert_eq!(core.state, replayed);
         assert_eq!(core.state.canonical_json(), replayed.canonical_json());
@@ -941,6 +945,140 @@ mod tests {
         let outcome = ExecutionEngine::new().run(&mut drc, &mut core);
         assert_eq!(outcome, PhaseOutcome::Success);
         assert_eq!(core.state.violations.len(), raised_before); // no duplicates raised
+
+        // replay identity holds across the run + waive + re-verify.
+        let replayed = replay(core.log()).unwrap();
+        assert_eq!(core.state, replayed);
+    }
+
+    /// A reasoner like [`OversizeReasoner`] but with a 32.3 mm enclosure: the third component's
+    /// courtyard ends at x = 32 mm, so it *fits* the 32.3 mm outline (DRC out-of-bounds passes)
+    /// yet sits only 0.3 mm from the right edge — inside the 0.5 mm DFM board-edge keep-out. The
+    /// rail is driven (clean ERC) and both parts are Active (clean BOM), so the design reaches
+    /// DFM clean and fails only there: the one fault produced at the manufacturability gate.
+    struct EdgeClearanceReasoner;
+    impl ReasoningEngine for EdgeClearanceReasoner {
+        fn model_id(&self) -> String {
+            "edge-clearance".into()
+        }
+        fn request_judgement(
+            &self,
+            _req: &ReasoningRequest,
+        ) -> Result<ReasoningResponse, ReasoningError> {
+            use eak_units::{PhysicalQuantity, Unit};
+            Ok(ReasoningResponse {
+                candidates: vec![
+                    CandidateRequirement {
+                        statement: "USB-C connector shall supply 5 V to the board".into(),
+                        category: RequirementCategory::Functional,
+                        priority: Priority::High,
+                        acceptance_criterion: "VBUS present at 5 V".into(),
+                        source_hint: "intent: USB-C power entry".into(),
+                        confidence: 0.9,
+                        rationale: "power entry".into(),
+                        targets: vec![],
+                    },
+                    // 32.3 mm square outline: wide enough for the whole 12 mm-pitch row (the last
+                    // courtyard ends at 32 mm) but leaving only 0.3 mm of edge margin.
+                    CandidateRequirement {
+                        statement: "Enclosure limits the board to a 32.3 mm square outline".into(),
+                        category: RequirementCategory::Mechanical,
+                        priority: Priority::High,
+                        acceptance_criterion: "outline <= 32.3 mm on each side".into(),
+                        source_hint: "intent: enclosure size".into(),
+                        confidence: 0.9,
+                        rationale: "mechanical envelope".into(),
+                        targets: vec![PhysicalQuantity::new(32.3, Unit::Millimetre)],
+                    },
+                    CandidateRequirement {
+                        statement: "Microcontroller shall run the sensing firmware".into(),
+                        category: RequirementCategory::Electrical,
+                        priority: Priority::High,
+                        acceptance_criterion: "firmware boots and samples".into(),
+                        source_hint: "intent: sensing load".into(),
+                        confidence: 0.9,
+                        rationale: "compute load".into(),
+                        targets: vec![],
+                    },
+                ],
+                clarifying_questions: vec![],
+                raw: "{}".into(),
+            })
+        }
+    }
+
+    #[test]
+    fn dfm_edge_clearance_waiver_lets_reverification_pass() {
+        let mut core = RuntimeCore::new(
+            Box::new(MemLog { records: vec![] }),
+            Box::new(EdgeClearanceReasoner),
+            Box::new(SeededIdSource::new(7)),
+            Box::new(LogicalClock::new()),
+            Autonomy::Autonomous,
+        );
+        core.capture_intent("USB-C sensor node in a snug enclosure", "engineer")
+            .unwrap();
+
+        // Run the full 13-phase chain linearly. ERC, BOM, and DRC are clean (a driven rail,
+        // Active parts, every courtyard inside the outline), but the trailing component hugs the
+        // board edge, so DFM fails on the edge-clearance rule and the linear plan stops there.
+        let mut plan = WorkflowPlan::new(vec![
+            Box::new(RequirementPlanningMachine::new()),
+            Box::new(EngineeringAnalysisMachine::new()),
+            Box::new(ConstraintExtractionMachine::new()),
+            Box::new(ConstraintVerificationMachine::new()),
+            Box::new(SchematicPlanningMachine::new()),
+            Box::new(ErcVerificationMachine::new()),
+            Box::new(BomPlanningMachine::new()),
+            Box::new(BomVerificationMachine::new()),
+            Box::new(PcbFloorPlanningMachine::new()),
+            Box::new(ComponentPlacementMachine::new()),
+            Box::new(RoutingPlanningMachine::new()),
+            Box::new(DrcVerificationMachine::new()),
+            Box::new(DfmVerificationMachine::new()),
+        ]);
+        let results = Orchestrator::new().run(&mut plan, &mut core);
+        assert_eq!(results.len(), 13);
+
+        // DRC (index 11) passed — the layout fits and the traces are clear.
+        assert_eq!(results[11].1, PhaseOutcome::Success);
+        // The final phase (DFM Verification) failed.
+        assert_eq!(results.last().unwrap().0, "DfmVerification");
+        assert!(matches!(results.last().unwrap().1, PhaseOutcome::Failed(_)));
+
+        // Exactly one open, blocking violation: the edge-hugging courtyard.
+        assert_eq!(core.state.violations.len(), 1);
+        assert!(core.state.violations[0].is_blocking());
+        assert_eq!(core.state.violations[0].rule, "dfm-edge-clearance");
+        // It names a placement (the traceability anchor back through the component to intent).
+        assert_eq!(core.state.violations[0].subjects.len(), 1);
+        assert!(core
+            .state
+            .placement(core.state.violations[0].subjects[0])
+            .is_some());
+
+        // Accept the violation via the only write path — the Capability port (P2).
+        let vid = core.state.violations[0].id;
+        let wid = core.fresh_id();
+        core.invoke(CapabilityRequest::GrantWaiver {
+            waiver: Waiver {
+                id: wid,
+                violation: vid,
+                justification: "edge keep-out accepted for prototype bring-up".into(),
+                decided_by: "engineer".into(),
+            },
+        })
+        .expect("waiver granted");
+        assert_eq!(core.state.violations[0].status, ViolationStatus::Waived);
+        assert!(!core.state.violations[0].is_blocking());
+
+        // Re-verify DFM: the edge-hugging courtyard is still found, but the violation is waived,
+        // so no new violation is raised and nothing blocks — the phase now passes.
+        let mut dfm = DfmVerificationMachine::new();
+        let outcome = ExecutionEngine::new().run(&mut dfm, &mut core);
+        assert_eq!(outcome, PhaseOutcome::Success);
+        assert_eq!(core.state.violations.len(), 1); // no duplicate raised
+        assert_eq!(core.state.waivers.len(), 1);
 
         // replay identity holds across the run + waive + re-verify.
         let replayed = replay(core.log()).unwrap();

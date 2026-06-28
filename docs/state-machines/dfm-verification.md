@@ -24,8 +24,8 @@
 | `TriagingViolations` | Normal (Reviewing) | [DFM Agent](../agents/dfm-agent.md) explains violations and suggests fixes (severity/gating remain deterministic). |
 | `AwaitingDisposition` | Waiting / HITL | Engineer adjusts the design, or authorizes [Waivers](../foundation/engineering-domain-model.md#waiver) at the [Autonomy Level](../engineering/human-in-the-loop.md). |
 | `RecordingWaivers` | Normal (Applying) | Persists authorized waivers with rationale, scope, expiry, and [provenance](../core/provenance-and-traceability.md). |
-| `Passed` | Terminal (success) | No open error-severity violations; orchestrator advances to [EMC Analysis](emc-analysis.md). |
-| `Failed` | Terminal (failure) | Open error-severity violations remain → orchestrator loops back to [Component Placement](component-placement.md). |
+| `Passed` | Terminal (success) | No open error-severity violations **from this phase's own rules**; orchestrator advances to [EMC Analysis](emc-analysis.md). (Per-phase gating: a violation from another rule-check phase does not fail DFM — the cross-phase all-clear is the [Manufacturing gate](manufacturing-generation.md), per *Persistence* below.) |
+| `Failed` | Terminal (failure) | Open error-severity violations **from this phase's own rules** remain → orchestrator loops back to [Component Placement](component-placement.md). |
 
 ## Transitions
 

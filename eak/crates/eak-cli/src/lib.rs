@@ -8,9 +8,10 @@
 use eak_domain::RelationType;
 use eak_phases::{
     BomPlanningMachine, BomVerificationMachine, ComponentPlacementMachine,
-    ConstraintExtractionMachine, ConstraintVerificationMachine, DrcVerificationMachine,
-    EngineeringAnalysisMachine, ErcVerificationMachine, PcbFloorPlanningMachine,
-    RequirementPlanningMachine, RoutingPlanningMachine, SchematicPlanningMachine,
+    ConstraintExtractionMachine, ConstraintVerificationMachine, DfmVerificationMachine,
+    DrcVerificationMachine, EngineeringAnalysisMachine, ErcVerificationMachine,
+    PcbFloorPlanningMachine, RequirementPlanningMachine, RoutingPlanningMachine,
+    SchematicPlanningMachine,
 };
 use eak_ports::ReasoningEngine;
 use eak_reasoning::{Cassette, FixtureEngine};
@@ -140,19 +141,22 @@ pub fn run_with(
 /// The default Phase-3 workflow: Requirement Planning -> Engineering Analysis ->
 /// Constraint Extraction -> Constraint Verification -> Schematic Planning -> ERC
 /// Verification -> BOM Planning -> BOM Verification -> PCB Floor Planning ->
-/// Component Placement -> Routing Planning -> DRC Verification. Only Requirement Planning
-/// reasons (P3); every other phase here is deterministic, so a run replays bit-identically (P4).
+/// Component Placement -> Routing Planning -> DRC Verification -> DFM Verification. Only
+/// Requirement Planning reasons (P3); every other phase here is deterministic, so a run replays
+/// bit-identically (P4).
 ///
-/// Four correctness-loop edges bound the self-correction: a failed constraint verification
+/// Five correctness-loop edges bound the self-correction: a failed constraint verification
 /// routes back to extraction, a failed ERC routes back to schematic planning, a failed
-/// BOM verification routes back to BOM planning, and a failed DRC routes back to routing
-/// planning (clearance/geometry defects are routing defects — the canonical loop-back target;
-/// each capped at `max_retries` 2). Because extraction, schematic planning, BOM planning, and
-/// routing planning are *idempotent* (a re-entry produces the identical artifact), the loop is a
-/// no-op recovery for a design that is genuinely infeasible: it deterministically exhausts the
-/// retries and then surfaces the open, blocking violation rather than looping forever (P13). The
-/// loop-back is the seam where a future reasoning-assisted re-synthesis (or a human waiver
-/// between passes) can actually change the artifact and clear the violation.
+/// BOM verification routes back to BOM planning, a failed DRC routes back to routing planning
+/// (clearance/geometry defects are routing defects), and a failed DFM routes back to component
+/// placement (manufacturability defects are usually placement-driven) — each the canonical
+/// loop-back target, capped at `max_retries` 2. Because extraction, schematic planning, BOM
+/// planning, routing planning, and component placement are *idempotent* (a re-entry produces the
+/// identical artifact), the loop is a no-op recovery for a design that is genuinely infeasible:
+/// it deterministically exhausts the retries and then surfaces the open, blocking violation
+/// rather than looping forever (P13). The loop-back is the seam where a future reasoning-assisted
+/// re-synthesis (or a human waiver between passes) can actually change the artifact and clear the
+/// violation.
 fn default_workflow() -> WorkflowPlan {
     WorkflowPlan::with_loopbacks(
         vec![
@@ -168,6 +172,7 @@ fn default_workflow() -> WorkflowPlan {
             Box::new(ComponentPlacementMachine::new()),
             Box::new(RoutingPlanningMachine::new()),
             Box::new(DrcVerificationMachine::new()),
+            Box::new(DfmVerificationMachine::new()),
         ],
         vec![
             LoopBack {
@@ -188,6 +193,11 @@ fn default_workflow() -> WorkflowPlan {
             LoopBack {
                 from: "DrcVerification".into(),
                 to: "RoutingPlanning".into(),
+                max_retries: 2,
+            },
+            LoopBack {
+                from: "DfmVerification".into(),
+                to: "ComponentPlacement".into(),
                 max_retries: 2,
             },
         ],
@@ -383,7 +393,22 @@ pub fn run_cli() -> ExitCode {
                 seed,
                 deterministic_clock: deterministic,
             };
-            run(&cfg).map(|report| print_run(&report, show_state))
+            run(&cfg).and_then(|report| {
+                print_run(&report, show_state);
+                // A run that ends with open, blocking violations (e.g. a fault whose loop-back
+                // exhausted its retries) is a design failure, not a CLI success: surface it in
+                // the exit code so a CI gate can act on it. The library `run`/`run_with` still
+                // return `Ok` so callers can inspect the report; only the binary's exit code
+                // reflects design health.
+                let open = report.state.open_blocking_violations().len();
+                if open == 0 {
+                    Ok(())
+                } else {
+                    Err(CliError::Msg(format!(
+                        "design has {open} open blocking violation(s) — see the phase outcomes above"
+                    )))
+                }
+            })
         }
         Command::Replay { log, show_state } => {
             replay_cmd(&log).map(|state| print_replay(&state, show_state))
