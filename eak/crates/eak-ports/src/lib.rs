@@ -10,8 +10,8 @@
 //! the "a contract lives with the ring that needs it" rule they belong to the kernel.
 
 use eak_domain::{
-    Component, Constraint, Decision, DesignIntent, Evidence, FunctionalBlock, Net, Pin, Priority,
-    ProvenanceLink, Requirement, RequirementCategory, Violation, Waiver,
+    BomLineItem, Component, Constraint, Decision, DesignIntent, Evidence, FunctionalBlock, Net,
+    Part, Pin, Priority, ProvenanceLink, Requirement, RequirementCategory, Violation, Waiver,
 };
 use eak_units::PhysicalQuantity;
 use serde::{Deserialize, Serialize};
@@ -116,6 +116,14 @@ pub enum Event {
         net: Net,
     },
 
+    // ---- Phase 3 (BOM): bill-of-materials state deltas ----
+    PartCommitted {
+        part: Part,
+    },
+    BomLineItemCommitted {
+        item: BomLineItem,
+    },
+
     // ---- IR boundary milestones (audit) ----
     RequirementIrProduced {
         schema_version: u32,
@@ -128,6 +136,10 @@ pub enum Event {
     SchematicIrProduced {
         schema_version: u32,
         net_count: usize,
+    },
+    BomIrProduced {
+        schema_version: u32,
+        line_item_count: usize,
     },
 }
 

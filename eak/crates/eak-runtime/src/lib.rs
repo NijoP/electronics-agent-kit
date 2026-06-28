@@ -51,8 +51,9 @@ mod dependency_rule {
 mod kernel_tests {
     use super::*;
     use eak_domain::{
-        Component, ComponentClass, Decision, EntityId, FunctionalBlock, Net, NetClass, Pin,
-        PinElectricalType, Priority, Requirement, RequirementCategory, RequirementStatus,
+        BomLineItem, Component, ComponentClass, Decision, EntityId, FunctionalBlock, Net, NetClass,
+        Part, PartLifecycle, Pin, PinElectricalType, Priority, Requirement, RequirementCategory,
+        RequirementStatus,
     };
     use eak_ports::{
         Event, EventLog, EventRecord, ReasoningEngine, ReasoningError, ReasoningRequest,
@@ -250,6 +251,205 @@ mod kernel_tests {
         let replayed = replay(core.log()).unwrap();
         assert_eq!(core.state, replayed);
         assert_eq!(core.state.canonical_json(), replayed.canonical_json());
+    }
+
+    /// Drive the full chain down into the BOM layer: requirement -> block -> component, then
+    /// a [`Part`] and a [`BomLineItem`] binding the part to that real component. Asserts the
+    /// fold landed and that replay reconstructs byte-identical state (the Phase-1 exit
+    /// criterion, extended to the BOM deltas).
+    #[test]
+    fn phase3_bom_commits_fold_and_replay_byte_identically() {
+        let mut core = new_core();
+        core.capture_intent("USB-C powered IoT sensor node, 3.3 V rail", "engineer")
+            .unwrap();
+        let src = core.state.intent.as_ref().unwrap().id;
+        let rid = core.fresh_id();
+        let did = core.fresh_id();
+        core.invoke(CapabilityRequest::CreateRequirement {
+            requirement: Requirement {
+                id: rid,
+                statement: "Device shall regulate to 3.3 V".into(),
+                category: RequirementCategory::Electrical,
+                priority: Priority::High,
+                acceptance_criterion: "rail measures 3.3 V".into(),
+                status: RequirementStatus::Accepted,
+                source: src,
+                targets: vec![],
+            },
+            decision: Decision {
+                id: did,
+                subject: rid,
+                rationale: "from intent".into(),
+                decider: "test".into(),
+                reasoning_call_seq: None,
+                evidence: vec![],
+                confidence: 1.0,
+            },
+            evidence: vec![],
+            links: vec![],
+        })
+        .unwrap();
+
+        let block = FunctionalBlock {
+            id: core.fresh_id(),
+            name: "3V3 regulation".into(),
+            function: "step VBUS down to 3.3 V".into(),
+            requirements: vec![rid],
+        };
+        let bid = block.id;
+        core.invoke(CapabilityRequest::CreateFunctionalBlock {
+            block,
+            links: vec![],
+        })
+        .unwrap();
+
+        let comp = Component {
+            id: core.fresh_id(),
+            refdes: "U1".into(),
+            class: ComponentClass::Regulator,
+            value: None,
+            from_block: bid,
+        };
+        let cid = comp.id;
+        let pin = Pin {
+            id: core.fresh_id(),
+            component: cid,
+            designation: "VOUT".into(),
+            electrical_type: PinElectricalType::PowerOut,
+        };
+        core.invoke(CapabilityRequest::RealizeComponent {
+            component: comp,
+            pins: vec![pin],
+            links: vec![],
+        })
+        .unwrap();
+
+        // The BOM layer: a concrete part, then a line binding it to the real component.
+        let part = Part {
+            id: core.fresh_id(),
+            mpn: "LM1117-3.3".into(),
+            manufacturer: "Texas Instruments".into(),
+            lifecycle: PartLifecycle::Eol,
+            datasheet: "https://ti.com/lm1117".into(),
+        };
+        let part_id = part.id;
+        core.invoke(CapabilityRequest::CreatePart {
+            part,
+            links: vec![],
+        })
+        .unwrap();
+
+        let item = BomLineItem {
+            id: core.fresh_id(),
+            part: part_id,
+            components: vec![cid],
+            quantity: 1,
+        };
+        let item_id = item.id;
+        core.invoke(CapabilityRequest::CreateBomLineItem {
+            item,
+            links: vec![],
+        })
+        .unwrap();
+
+        assert_eq!(core.state.parts.len(), 1);
+        assert_eq!(core.state.bom_line_items.len(), 1);
+        assert!(core.state.part(part_id).is_some());
+        assert!(core.state.bom_line_item(item_id).is_some());
+
+        let replayed = replay(core.log()).unwrap();
+        assert_eq!(core.state, replayed);
+        assert_eq!(core.state.canonical_json(), replayed.canonical_json());
+    }
+
+    /// The BOM seam mirrors the synthesis seam: a line with zero quantity, an empty component
+    /// list, an unknown part, or an unknown component is rejected before the commit path.
+    #[test]
+    fn bom_line_item_handler_rejects_untraceable_proposals_at_the_seam() {
+        let mut core = new_core();
+        // Pre-mint every id (fresh_id borrows the core mutably, so it cannot run inside an
+        // `invoke` argument).
+        let fake_part = core.fresh_id();
+        let fake_comp = core.fresh_id();
+        let pid = core.fresh_id();
+        let (id1, id2, id3, id4) = (
+            core.fresh_id(),
+            core.fresh_id(),
+            core.fresh_id(),
+            core.fresh_id(),
+        );
+
+        // A committed part to isolate the component-integrity check below.
+        core.invoke(CapabilityRequest::CreatePart {
+            part: Part {
+                id: pid,
+                mpn: "RC0402FR-0710KL".into(),
+                manufacturer: "Yageo".into(),
+                lifecycle: PartLifecycle::Active,
+                datasheet: "https://yageo.com/rc0402".into(),
+            },
+            links: vec![],
+        })
+        .unwrap();
+
+        // Zero quantity.
+        let err = core
+            .invoke(CapabilityRequest::CreateBomLineItem {
+                item: BomLineItem {
+                    id: id1,
+                    part: pid,
+                    components: vec![fake_comp],
+                    quantity: 0,
+                },
+                links: vec![],
+            })
+            .unwrap_err();
+        assert!(matches!(err, CapabilityError::Rejected(_)));
+
+        // No components covered.
+        let err = core
+            .invoke(CapabilityRequest::CreateBomLineItem {
+                item: BomLineItem {
+                    id: id2,
+                    part: pid,
+                    components: vec![],
+                    quantity: 1,
+                },
+                links: vec![],
+            })
+            .unwrap_err();
+        assert!(matches!(err, CapabilityError::Rejected(_)));
+
+        // Unknown part.
+        let err = core
+            .invoke(CapabilityRequest::CreateBomLineItem {
+                item: BomLineItem {
+                    id: id3,
+                    part: fake_part,
+                    components: vec![fake_comp],
+                    quantity: 1,
+                },
+                links: vec![],
+            })
+            .unwrap_err();
+        assert!(matches!(err, CapabilityError::Rejected(_)));
+
+        // Known part but unknown component.
+        let err = core
+            .invoke(CapabilityRequest::CreateBomLineItem {
+                item: BomLineItem {
+                    id: id4,
+                    part: pid,
+                    components: vec![fake_comp],
+                    quantity: 1,
+                },
+                links: vec![],
+            })
+            .unwrap_err();
+        assert!(matches!(err, CapabilityError::Rejected(_)));
+
+        // Nothing landed in the BOM line-item store.
+        assert!(core.state.bom_line_items.is_empty());
     }
 
     #[test]

@@ -5,8 +5,9 @@
 //! run and during [`crate::replay`], guaranteeing identical reconstruction.
 
 use eak_domain::{
-    Component, Constraint, Decision, DesignIntent, EntityId, Evidence, FunctionalBlock, Net, Pin,
-    ProvenanceLink, Requirement, Violation, ViolationStatus, Waiver,
+    BomLineItem, Component, Constraint, Decision, DesignIntent, EntityId, Evidence,
+    FunctionalBlock, Net, Part, Pin, ProvenanceLink, Requirement, Violation, ViolationStatus,
+    Waiver,
 };
 use eak_ports::Event;
 use serde::{Deserialize, Serialize};
@@ -29,6 +30,9 @@ pub struct EngineeringState {
     pub components: Vec<Component>,
     pub pins: Vec<Pin>,
     pub nets: Vec<Net>,
+    // Phase 3 (BOM): concrete parts and the line items binding them to components.
+    pub parts: Vec<Part>,
+    pub bom_line_items: Vec<BomLineItem>,
 }
 
 impl EngineeringState {
@@ -65,6 +69,8 @@ impl EngineeringState {
             Event::ComponentCommitted { component } => self.components.push(component.clone()),
             Event::PinCommitted { pin } => self.pins.push(pin.clone()),
             Event::NetCommitted { net } => self.nets.push(net.clone()),
+            Event::PartCommitted { part } => self.parts.push(part.clone()),
+            Event::BomLineItemCommitted { item } => self.bom_line_items.push(item.clone()),
             // Audit-only events (phase lifecycle, reasoning calls, IR-boundary milestones)
             // carry no state and are intentionally not folded. AUDIT: any NEW state-bearing
             // event variant MUST get an explicit arm above, or replay will silently diverge.
@@ -106,6 +112,14 @@ impl EngineeringState {
 
     pub fn net(&self, id: EntityId) -> Option<&Net> {
         self.nets.iter().find(|n| n.id == id)
+    }
+
+    pub fn part(&self, id: EntityId) -> Option<&Part> {
+        self.parts.iter().find(|p| p.id == id)
+    }
+
+    pub fn bom_line_item(&self, id: EntityId) -> Option<&BomLineItem> {
+        self.bom_line_items.iter().find(|i| i.id == id)
     }
 
     /// Open, blocking (error-severity) violations — the workflow gate (P13).

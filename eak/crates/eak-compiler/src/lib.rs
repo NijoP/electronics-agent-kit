@@ -5,14 +5,15 @@
 //! [`SchematicIr`] projections (transformation P1) at the engineering and schematic seams.
 
 use eak_domain::{
-    Component, Constraint, DesignIntent, EntityId, FunctionalBlock, Net, Pin, ProvenanceLink,
-    Requirement, RequirementStatus,
+    BomLineItem, Component, Constraint, DesignIntent, EntityId, FunctionalBlock, Net, Part, Pin,
+    ProvenanceLink, Requirement, RequirementStatus,
 };
 use serde::{Deserialize, Serialize};
 
 pub const REQUIREMENT_IR_SCHEMA_VERSION: u32 = 1;
 pub const ENGINEERING_IR_SCHEMA_VERSION: u32 = 1;
 pub const SCHEMATIC_IR_SCHEMA_VERSION: u32 = 1;
+pub const BOM_IR_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IrError {
@@ -21,6 +22,9 @@ pub enum IrError {
     BlockWithoutRequirement(EntityId),
     OrphanComponent(EntityId),
     UnknownNetMember(EntityId),
+    UnknownPart(EntityId),
+    LineItemUnknownComponent(EntityId),
+    UncoveredComponent(EntityId),
 }
 impl std::fmt::Display for IrError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -51,6 +55,19 @@ impl std::fmt::Display for IrError {
             }
             IrError::UnknownNetMember(id) => {
                 write!(f, "net references unknown pin {}", id.short())
+            }
+            IrError::UnknownPart(id) => {
+                write!(f, "bom line item orders unknown part {}", id.short())
+            }
+            IrError::LineItemUnknownComponent(id) => {
+                write!(f, "bom line item covers unknown component {}", id.short())
+            }
+            IrError::UncoveredComponent(id) => {
+                write!(
+                    f,
+                    "schematic component {} is not covered by any bom line item",
+                    id.short()
+                )
             }
         }
     }
@@ -185,10 +202,65 @@ impl SchematicIr {
     }
 }
 
+/// The fourth IR: the bill of materials at the boundary out of BOM Planning — the concrete
+/// [`Part`]s, the [`BomLineItem`]s binding them to schematic [`Component`]s, and the components
+/// they cover. A projection of canonical state (P6); never authored.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BomIr {
+    pub schema_version: u32,
+    pub schematic_ir_schema_version: u32,
+    pub parts: Vec<Part>,
+    pub line_items: Vec<BomLineItem>,
+    pub components: Vec<Component>,
+}
+
+impl BomIr {
+    /// Project canonical state into the BOM IR (transformation P1), enforcing procurement
+    /// integrity: every line item orders a part that exists (P3), covers only components that
+    /// exist upstream in the schematic (P3), and every schematic component is covered by at
+    /// least one line item — no component ships unsourced (P13).
+    pub fn project(
+        schematic: &SchematicIr,
+        parts: &[Part],
+        line_items: &[BomLineItem],
+    ) -> Result<Self, IrError> {
+        for item in line_items {
+            // invariant: the ordered part is rooted in the part list (P3).
+            if !parts.iter().any(|p| p.id == item.part) {
+                return Err(IrError::UnknownPart(item.part));
+            }
+            // invariant: every covered component is a real schematic component (P3).
+            for cid in &item.components {
+                if !schematic.components.iter().any(|c| c.id == *cid) {
+                    return Err(IrError::LineItemUnknownComponent(*cid));
+                }
+            }
+        }
+        // invariant: every schematic component is covered by >=1 line item (P13).
+        for c in &schematic.components {
+            if !line_items
+                .iter()
+                .any(|item| item.components.contains(&c.id))
+            {
+                return Err(IrError::UncoveredComponent(c.id));
+            }
+        }
+        Ok(Self {
+            schema_version: BOM_IR_SCHEMA_VERSION,
+            schematic_ir_schema_version: schematic.schema_version,
+            parts: parts.to_vec(),
+            line_items: line_items.to_vec(),
+            components: schematic.components.clone(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eak_domain::{ComponentClass, NetClass, PinElectricalType, Priority, RequirementCategory};
+    use eak_domain::{
+        ComponentClass, NetClass, PartLifecycle, PinElectricalType, Priority, RequirementCategory,
+    };
 
     fn intent() -> DesignIntent {
         DesignIntent {
@@ -327,6 +399,75 @@ mod tests {
         assert!(matches!(
             SchematicIr::project(&eng, &[c], &[p], &[n]),
             Err(IrError::UnknownNetMember(_))
+        ));
+    }
+
+    fn part(id: u128) -> Part {
+        Part {
+            id: EntityId(id),
+            mpn: "LM1117-3.3".into(),
+            manufacturer: "Texas Instruments".into(),
+            lifecycle: PartLifecycle::Active,
+            datasheet: "https://ti.com/lm1117".into(),
+        }
+    }
+    fn line_item(id: u128, part: EntityId, components: Vec<EntityId>) -> BomLineItem {
+        BomLineItem {
+            id: EntityId(id),
+            part,
+            components,
+            quantity: 1,
+        }
+    }
+    fn schematic_ir() -> SchematicIr {
+        let eng = EngineeringIr::project(&req_ir(), &[block(10, vec![EntityId(2)])], &[]).unwrap();
+        let c = component(20, EntityId(10));
+        SchematicIr::project(&eng, &[c], &[], &[]).unwrap()
+    }
+
+    #[test]
+    fn bom_project_links_parts_to_components() {
+        let sch = schematic_ir();
+        let p = part(50);
+        let item = line_item(60, EntityId(50), vec![EntityId(20)]);
+        let bom = BomIr::project(&sch, &[p], &[item]).unwrap();
+        assert_eq!(bom.schema_version, BOM_IR_SCHEMA_VERSION);
+        assert_eq!(bom.schematic_ir_schema_version, sch.schema_version);
+        assert_eq!(bom.parts.len(), 1);
+        assert_eq!(bom.line_items.len(), 1);
+        assert_eq!(bom.components.len(), 1);
+        assert_eq!(bom.line_items[0].components, vec![EntityId(20)]);
+    }
+
+    #[test]
+    fn bom_project_rejects_unknown_part() {
+        let sch = schematic_ir();
+        // line item orders a part (99) that is not in the part list.
+        let item = line_item(60, EntityId(99), vec![EntityId(20)]);
+        assert!(matches!(
+            BomIr::project(&sch, &[part(50)], &[item]),
+            Err(IrError::UnknownPart(_))
+        ));
+    }
+
+    #[test]
+    fn bom_project_rejects_line_item_unknown_component() {
+        let sch = schematic_ir();
+        // line item covers a component (21) that is not in the schematic.
+        let item = line_item(60, EntityId(50), vec![EntityId(21)]);
+        assert!(matches!(
+            BomIr::project(&sch, &[part(50)], &[item]),
+            Err(IrError::LineItemUnknownComponent(_))
+        ));
+    }
+
+    #[test]
+    fn bom_project_rejects_uncovered_component() {
+        let sch = schematic_ir();
+        // no line item covers schematic component 20.
+        assert!(matches!(
+            BomIr::project(&sch, &[], &[]),
+            Err(IrError::UncoveredComponent(_))
         ));
     }
 }

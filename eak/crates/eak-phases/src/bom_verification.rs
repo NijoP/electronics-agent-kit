@@ -1,42 +1,47 @@
-//! Constraint Verification state machine (instance) — the gate of the correctness loop.
+//! BOM Verification state machine (instance) — the gate of the BOM correctness loop.
 //!
-//! It runs the generic [`VerificationEngine`] over the committed requirements and
-//! constraints, turns each *new* finding into a first-class [`Violation`] (linked back to
-//! the constraints it implicates so it is fully traceable to its cause), and records the
-//! [`Event::VerificationCompleted`] milestone. If any blocking (open, error-severity)
-//! violation remains it reports [`StepResult::Failed`], which the orchestrator routes back
-//! to Constraint Extraction; otherwise the phase is [`StepResult::Done`]. Re-verification is
-//! idempotent — an already-raised violation (open OR waived) is never duplicated — so a
-//! waiver granted between passes lets the re-verify succeed. See
-//! `docs/state-machines/constraint-verification.md`.
+//! Structurally a sibling of [`ErcVerificationMachine`](crate::ErcVerificationMachine), but its
+//! [`VerificationEngine`] is loaded with the BOM rules ([`BomCoverageRule`],
+//! [`BomLifecycleRule`]) and it runs them over the realized schematic plus its bill of
+//! materials (parts, line items). Each *new* finding becomes a first-class [`Violation`] linked
+//! back to the subject(s) it implicates so it is fully traceable to its cause (P3), and the
+//! [`Event::VerificationCompleted`] milestone is recorded. If any blocking (open,
+//! error-severity) violation remains — e.g. an end-of-life part — it reports
+//! [`StepResult::Failed`], which the orchestrator routes back to BOM Planning; otherwise the
+//! phase is [`StepResult::Done`]. Re-verification is idempotent — an already-raised violation
+//! (open OR waived) is never duplicated — so a waiver granted between passes lets the re-verify
+//! succeed. See `docs/state-machines/bom-verification.md`.
 
 use eak_domain::{ProvenanceLink, RelationType, Violation, ViolationStatus};
-use eak_engines::{ConstraintConsistencyRule, VerificationContext, VerificationEngine};
+use eak_engines::{BomCoverageRule, BomLifecycleRule, VerificationContext, VerificationEngine};
 use eak_ports::Event;
 use eak_runtime::{AgentContext, CapabilityRequest, Machine, MachineError, StepResult};
 
-pub struct ConstraintVerificationMachine;
+pub struct BomVerificationMachine;
 
-impl ConstraintVerificationMachine {
+impl BomVerificationMachine {
     pub fn new() -> Self {
         Self
     }
 
-    /// The verification engine for this phase. Phase 2 registers a single rule; ERC/DRC/DFM
-    /// rules plug into the same engine in later phases.
+    /// The verification engine for this phase: the two Phase-3 BOM rules registered against
+    /// the same generic framework that Constraint and ERC Verification use (reuse: one
+    /// framework, many checks).
     fn engine() -> VerificationEngine {
-        VerificationEngine::new().with_rule(Box::new(ConstraintConsistencyRule::new()))
+        VerificationEngine::new()
+            .with_rule(Box::new(BomCoverageRule::new()))
+            .with_rule(Box::new(BomLifecycleRule::new()))
     }
 }
-impl Default for ConstraintVerificationMachine {
+impl Default for BomVerificationMachine {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Machine for ConstraintVerificationMachine {
+impl Machine for BomVerificationMachine {
     fn name(&self) -> &str {
-        "ConstraintVerification"
+        "BomVerification"
     }
 
     fn initial(&self) -> String {
@@ -55,8 +60,6 @@ impl Machine for ConstraintVerificationMachine {
                 let engine = Self::engine();
                 let requirements = ctx.requirements();
                 let constraints = ctx.constraints();
-                // The schematic slices are empty at this phase (synthesis happens later);
-                // passing them keeps the engine's context uniform across verification phases.
                 let components = ctx.components();
                 let pins = ctx.pins();
                 let nets = ctx.nets();
@@ -92,9 +95,9 @@ impl Machine for ConstraintVerificationMachine {
                         message: finding.message.clone(),
                         status: ViolationStatus::Open,
                     };
-                    // Link the violation to each implicated constraint; combined with the
-                    // constraints' own DerivedFrom links this completes the trace
-                    // Violation -> Constraint -> Requirement -> Intent.
+                    // Link the violation to each implicated subject (a component for coverage,
+                    // a line item for lifecycle); combined with the BOM's own TracesTo links
+                    // this completes the trace Violation -> LineItem/Component -> ... -> Intent.
                     let links: Vec<ProvenanceLink> = finding
                         .subjects
                         .iter()

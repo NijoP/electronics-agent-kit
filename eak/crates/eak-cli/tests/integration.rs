@@ -1,16 +1,20 @@
-//! End-to-end verification of the Phase-3 exit criteria over the full 6-phase workflow:
+//! End-to-end verification of the Phase-3 exit criteria over the full 8-phase workflow:
 //! Requirement Planning -> Engineering Analysis -> Constraint Extraction -> Constraint
-//! Verification -> Schematic Planning -> ERC Verification. A consistent, realizable design
-//! runs all six phases clean; an electrically-invalid one (a power net with consumers but no
-//! driver) is caught by ERC, routed back to Schematic Planning automatically, and left fully
-//! traceable to its cause. The Phase-1/2 guarantees (multi-phase orchestration, full
-//! requirement traceability, the constraint correctness loop, byte-identical replay) still
-//! hold over the larger workflow.
+//! Verification -> Schematic Planning -> ERC Verification -> BOM Planning -> BOM Verification.
+//! A consistent, realizable design runs all eight phases clean and lands a sourced bill of
+//! materials. Three kinds of fault are each caught at their gate, routed back automatically,
+//! and left fully traceable to their cause: an infeasible constraint pair (Constraint
+//! Verification), an electrically-invalid power net with consumers but no driver (ERC), and a
+//! procurement fault — an end-of-life catalog part — at the BOM lifecycle gate. The Phase-1/2
+//! guarantees (multi-phase orchestration, full requirement traceability, the correctness
+//! loops, byte-identical replay) still hold over the larger workflow.
 
 use eak_cli::{
     replay_cmd, run, run_with, trace_cmd, PhaseOutcome, ReasoningChoice, Relation, RunConfig,
 };
-use eak_domain::{Priority, RequirementCategory, ViolationSeverity, ViolationStatus};
+use eak_domain::{
+    PartLifecycle, Priority, RequirementCategory, ViolationSeverity, ViolationStatus,
+};
 use eak_ports::{CandidateRequirement, ReasoningEngine, ReasoningResponse};
 use eak_reasoning::FixtureEngine;
 use eak_units::{PhysicalQuantity, Unit};
@@ -101,14 +105,49 @@ fn load_only_engine() -> Box<dyn ReasoningEngine> {
     }))
 }
 
+/// A reasoning engine returning a voltage-regulator requirement plus one plain load, both with
+/// no physical targets (so no constraints, so the constraint gate is clean). Schematic Planning
+/// recognizes the "voltage regulator" wording and realizes a regulator component — its VOUT pin
+/// drives the rail, so ERC is clean and the workflow reaches the BOM layer. BOM Planning then
+/// resolves that regulator to its catalog part, the deliberately end-of-life LM1117-3.3, so the
+/// BOM lifecycle gate fails.
+fn regulator_and_load_engine() -> Box<dyn ReasoningEngine> {
+    let regulator = CandidateRequirement {
+        statement: "Board shall include a 3.3 V voltage regulator".into(),
+        category: RequirementCategory::Functional,
+        priority: Priority::High,
+        acceptance_criterion: "a regulated 3.3 V rail is present and within tolerance".into(),
+        source_hint: "intent: 3.3 V rail".into(),
+        confidence: 0.9,
+        rationale: "the logic core needs a regulated 3.3 V supply".into(),
+        targets: vec![],
+    };
+    let load = CandidateRequirement {
+        statement: "Logic core shall operate at 3.3 logic level".into(),
+        category: RequirementCategory::Electrical,
+        priority: Priority::High,
+        acceptance_criterion: "core I/O measured at 3.3 logic level".into(),
+        source_hint: "intent: logic".into(),
+        confidence: 0.9,
+        rationale: "stated logic level".into(),
+        targets: vec![],
+    };
+    Box::new(FixtureEngine::single(ReasoningResponse {
+        candidates: vec![regulator, load],
+        clarifying_questions: vec![],
+        raw: "{}".into(),
+    }))
+}
+
 #[test]
-fn run_replays_byte_identical_and_runs_six_phases() {
+fn run_replays_byte_identical_and_runs_eight_phases() {
     let (config, log) = cfg("det", 1);
     let report = run(&config).expect("run succeeds");
 
     // Full Phase-3 workflow on a consistent, realizable design: RP -> Engineering Analysis ->
-    // Constraint Extraction -> Constraint Verification -> Schematic Planning -> ERC, all OK.
-    assert_eq!(report.outcomes.len(), 6);
+    // Constraint Extraction -> Constraint Verification -> Schematic Planning -> ERC -> BOM
+    // Planning -> BOM Verification, all OK.
+    assert_eq!(report.outcomes.len(), 8);
     assert!(report
         .outcomes
         .iter()
@@ -123,6 +162,10 @@ fn run_replays_byte_identical_and_runs_six_phases() {
     assert!(!report.state.functional_blocks.is_empty());
     assert!(!report.state.components.is_empty());
     assert!(!report.state.nets.is_empty());
+
+    // The BOM layer landed: every component was sourced to a concrete part through a line item.
+    assert!(!report.state.parts.is_empty());
+    assert!(!report.state.bom_line_items.is_empty());
 
     // EXIT CRITERION (Phase 1, preserved): history replays to identical state, byte for byte.
     let replayed = replay_cmd(&log).expect("replay succeeds");
@@ -151,13 +194,18 @@ fn infeasible_constraints_are_caught_routed_back_and_left_traceable() {
         .any(|(n, o)| n == "ConstraintVerification" && matches!(o, PhaseOutcome::Failed(_))));
 
     // The workflow never progressed past the failed constraint gate — neither the schematic
-    // synthesis nor ERC ran. (Engineering Analysis sits *before* the gate, so it did run.)
+    // synthesis, ERC, nor the BOM layer ran. (Engineering Analysis sits *before* the gate, so
+    // it did run.)
     assert!(!report
         .outcomes
         .iter()
         .any(|(n, _)| n == "SchematicPlanning"));
     assert!(!report.outcomes.iter().any(|(n, _)| n == "ErcVerification"));
+    assert!(!report.outcomes.iter().any(|(n, _)| n == "BomPlanning"));
+    assert!(!report.outcomes.iter().any(|(n, _)| n == "BomVerification"));
     assert!(report.state.components.is_empty());
+    assert!(report.state.parts.is_empty());
+    assert!(report.state.bom_line_items.is_empty());
 
     // Exactly one violation (re-verification did not duplicate it), still OPEN and blocking.
     assert_eq!(report.state.violations.len(), 1);
@@ -228,6 +276,13 @@ fn undriven_power_net_is_caught_routed_back_and_left_traceable() {
     // The constraint phases ran clean upstream (these loads carry no targets, so no
     // constraints, so nothing to contradict).
     assert!(report.state.constraints.is_empty());
+
+    // The workflow never progressed past the failed ERC gate — the BOM layer never ran, so no
+    // parts were sourced.
+    assert!(!report.outcomes.iter().any(|(n, _)| n == "BomPlanning"));
+    assert!(!report.outcomes.iter().any(|(n, _)| n == "BomVerification"));
+    assert!(report.state.parts.is_empty());
+    assert!(report.state.bom_line_items.is_empty());
 
     // The workflow did not reach a clean end: its final phase is the failed ERC gate.
     let (last_name, last_outcome) = report.outcomes.last().expect("at least one phase ran");
@@ -308,6 +363,90 @@ fn undriven_power_net_is_caught_routed_back_and_left_traceable() {
 }
 
 #[test]
+fn bom_eol_part_is_caught_routed_back_and_left_traceable() {
+    let (config, log) = cfg("bom", 9);
+    let report =
+        run_with(regulator_and_load_engine(), &config).expect("run completes with a failure");
+
+    // The BOM correctness loop fired: BOM verification failed and was routed back to BOM
+    // Planning, bounded to 1 initial + 2 retries = 3 BOM-verification runs, every one failing.
+    let bom_runs: Vec<&PhaseOutcome> = report
+        .outcomes
+        .iter()
+        .filter(|(n, _)| n == "BomVerification")
+        .map(|(_, o)| o)
+        .collect();
+    assert_eq!(bom_runs.len(), 3);
+    assert!(bom_runs
+        .iter()
+        .all(|o| matches!(o, PhaseOutcome::Failed(_))));
+
+    // The schematic upstream was clean: the regulator drives the rail, so ERC passed and the
+    // workflow reached the BOM layer — parts were sourced and line items minted.
+    assert!(!report.state.parts.is_empty());
+    assert!(!report.state.bom_line_items.is_empty());
+
+    // Exactly one violation (loop-back re-verification did not duplicate it): an end-of-life
+    // part, OPEN + Error + blocking, raised by the BOM lifecycle rule.
+    assert_eq!(report.state.violations.len(), 1);
+    let v = &report.state.violations[0];
+    assert_eq!(v.status, ViolationStatus::Open);
+    assert_eq!(v.severity, ViolationSeverity::Error);
+    assert!(v.is_blocking());
+    assert_eq!(v.rule, "bom-lifecycle");
+
+    // FULLY TRACEABLE across the BOM layer: the violation names a BOM line item; resolve it to
+    // its end-of-life part AND to the components it covers, then walk each component back
+    // through its functional block to the requirement it realizes and on to the design intent.
+    let intent = report.state.intent.as_ref().expect("intent captured");
+    assert_eq!(v.subjects.len(), 1, "one end-of-life line item implicated");
+    for subject in &v.subjects {
+        let item = report
+            .state
+            .bom_line_item(*subject)
+            .expect("violation subject is a known BOM line item");
+
+        // The line orders the deliberately end-of-life catalog part (LM1117-3.3).
+        let part = report
+            .state
+            .part(item.part)
+            .expect("line item orders a known part");
+        assert_eq!(part.lifecycle, PartLifecycle::Eol);
+
+        // ... and binds it to real components, each traceable back to the captured intent.
+        assert!(!item.components.is_empty(), "the line covers components");
+        for comp_id in &item.components {
+            let component = report
+                .state
+                .component(*comp_id)
+                .expect("line covers a known component");
+            let block = report
+                .state
+                .functional_block(component.from_block)
+                .expect("component was realized from a known block");
+            assert!(
+                !block.requirements.is_empty(),
+                "block realizes a requirement"
+            );
+            for req_id in &block.requirements {
+                let req = report
+                    .state
+                    .requirement(*req_id)
+                    .expect("block realizes a known requirement");
+                assert_eq!(req.source, intent.id);
+            }
+        }
+    }
+
+    // Replay identity holds even for a failed, looped-back BOM run.
+    let replayed = replay_cmd(&log).expect("replay succeeds");
+    assert_eq!(report.state, replayed);
+    assert_eq!(report.state.canonical_json(), replayed.canonical_json());
+
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
 fn every_requirement_is_fully_traceable() {
     let (config, log) = cfg("trace", 2);
     let report = run(&config).expect("run succeeds");
@@ -344,7 +483,7 @@ fn two_runs_with_same_seed_are_identical() {
     let (c2, l2) = cfg("rep2", 7);
     let r1 = run(&c1).expect("run 1");
     let r2 = run(&c2).expect("run 2");
-    // determinism of the run itself (seeded ids + logical clock) across the 6-phase workflow.
+    // determinism of the run itself (seeded ids + logical clock) across the 8-phase workflow.
     assert_eq!(r1.state, r2.state);
     let _ = std::fs::remove_file(&l1);
     let _ = std::fs::remove_file(&l2);

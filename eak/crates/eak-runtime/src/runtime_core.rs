@@ -9,8 +9,8 @@ use crate::clock::{Clock, IdSource};
 use crate::protocol::{AgentContext, Autonomy, CapabilityAck, CapabilityError, CapabilityRequest};
 use crate::state::EngineeringState;
 use eak_domain::{
-    Component, Constraint, Decision, DesignIntent, EntityId, Evidence, FunctionalBlock, Net, Pin,
-    ProvenanceLink, Requirement, Violation, Waiver,
+    BomLineItem, Component, Constraint, Decision, DesignIntent, EntityId, Evidence,
+    FunctionalBlock, Net, Part, Pin, ProvenanceLink, Requirement, Violation, Waiver,
 };
 use eak_ports::{
     Event, EventLog, ReasoningEngine, ReasoningError, ReasoningRequest, ReasoningResponse, Seq,
@@ -308,6 +308,81 @@ impl RuntimeCore {
             .map_err(|e| CapabilityError::Rejected(e.to_string()))?;
         Ok(CapabilityAck { committed: seqs })
     }
+
+    fn handle_create_part(
+        &mut self,
+        part: Part,
+        links: Vec<ProvenanceLink>,
+    ) -> Result<CapabilityAck, CapabilityError> {
+        // The seam (P3): re-validate the part (non-empty manufacturer part number) before
+        // committing — an unorderable part must never enter the BOM.
+        part.validate()
+            .map_err(|e| CapabilityError::Rejected(e.to_string()))?;
+
+        let mut events = vec![Event::PartCommitted { part }];
+        for link in links {
+            events.push(Event::ProvenanceLinked { link });
+        }
+        let seqs = self
+            .commit(events)
+            .map_err(|e| CapabilityError::Rejected(e.to_string()))?;
+        Ok(CapabilityAck { committed: seqs })
+    }
+
+    fn handle_create_bom_line_item(
+        &mut self,
+        item: BomLineItem,
+        links: Vec<ProvenanceLink>,
+    ) -> Result<CapabilityAck, CapabilityError> {
+        // The seam (P3): re-validate intrinsic invariants — non-empty coverage, quantity
+        // equal to the component count, and no component listed twice.
+        item.validate()
+            .map_err(|e| CapabilityError::Rejected(e.to_string()))?;
+        if item.part.is_null() {
+            return Err(CapabilityError::Rejected(
+                "BOM line item has no part".into(),
+            ));
+        }
+        // Referential integrity at the seam: the ordered part must be committed, so a line
+        // can never bind a phantom part (P3, P5).
+        if self.state.part(item.part).is_none() {
+            return Err(CapabilityError::Rejected(format!(
+                "BOM line item references unknown part {}",
+                item.part.short()
+            )));
+        }
+        // Referential integrity + single-sourcing: every covered component must exist and
+        // must not already be claimed by another line — a component is ordered exactly once,
+        // so the BOM can never silently double-source or contradict itself (P5).
+        for cid in &item.components {
+            if self.state.component(*cid).is_none() {
+                return Err(CapabilityError::Rejected(format!(
+                    "BOM line item references unknown component {}",
+                    cid.short()
+                )));
+            }
+            if self
+                .state
+                .bom_line_items
+                .iter()
+                .any(|l| l.components.contains(cid))
+            {
+                return Err(CapabilityError::Rejected(format!(
+                    "BOM line item double-covers component {} (already on another line)",
+                    cid.short()
+                )));
+            }
+        }
+
+        let mut events = vec![Event::BomLineItemCommitted { item }];
+        for link in links {
+            events.push(Event::ProvenanceLinked { link });
+        }
+        let seqs = self
+            .commit(events)
+            .map_err(|e| CapabilityError::Rejected(e.to_string()))?;
+        Ok(CapabilityAck { committed: seqs })
+    }
 }
 
 impl AgentContext for RuntimeCore {
@@ -355,6 +430,14 @@ impl AgentContext for RuntimeCore {
         self.state.nets.clone()
     }
 
+    fn parts(&self) -> Vec<Part> {
+        self.state.parts.clone()
+    }
+
+    fn bom_line_items(&self) -> Vec<BomLineItem> {
+        self.state.bom_line_items.clone()
+    }
+
     fn reason(
         &mut self,
         mut req: ReasoningRequest,
@@ -396,6 +479,10 @@ impl AgentContext for RuntimeCore {
                 links,
             } => self.handle_realize_component(component, pins, links),
             CapabilityRequest::CreateNet { net, links } => self.handle_create_net(net, links),
+            CapabilityRequest::CreatePart { part, links } => self.handle_create_part(part, links),
+            CapabilityRequest::CreateBomLineItem { item, links } => {
+                self.handle_create_bom_line_item(item, links)
+            }
         }
     }
 

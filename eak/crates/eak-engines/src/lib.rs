@@ -6,8 +6,8 @@
 //! See `docs/engineering/constraint-engine.md` and `docs/engineering/verification-engine.md`.
 
 use eak_domain::{
-    Component, Constraint, ConstraintKind, EntityId, Net, NetClass, Pin, PinElectricalType,
-    Requirement, ViolationSeverity,
+    BomLineItem, Component, ComponentClass, Constraint, ConstraintKind, EntityId, Net, NetClass,
+    Part, PartLifecycle, Pin, PinElectricalType, Requirement, ViolationSeverity,
 };
 use eak_units::{PhysicalQuantity, UnitError};
 use std::cmp::Ordering;
@@ -96,13 +96,16 @@ fn feasible_interval(c: &Constraint) -> (f64, f64) {
 
 /// The read-only inputs a [`Rule`] evaluates against — a snapshot of the design's
 /// machine-checkable layer. Additive in Phase 3: the schematic layer (components, pins,
-/// nets) so ERC rules can reason over connectivity (P9).
+/// nets) so ERC rules can reason over connectivity, and the BOM layer (parts, line items)
+/// so BOM rules can reason over coverage and lifecycle (P9).
 pub struct VerificationContext<'a> {
     pub requirements: &'a [Requirement],
     pub constraints: &'a [Constraint],
     pub components: &'a [Component],
     pub pins: &'a [Pin],
     pub nets: &'a [Net],
+    pub parts: &'a [Part],
+    pub bom_line_items: &'a [BomLineItem],
 }
 
 /// A problem a rule detected. Not yet a domain `Violation` — the runtime mints that at the
@@ -320,6 +323,174 @@ impl Rule for ErcMultipleDriversRule {
     }
 }
 
+// ================================ Part Catalog =================================
+
+/// A catalog entry: the manufacturer part data a [`ComponentClass`] maps to. Carries
+/// `'static` strings — this is a fixed, compiled-in catalog, not a live distributor feed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CatalogPart {
+    pub mpn: &'static str,
+    pub manufacturer: &'static str,
+    pub lifecycle: PartLifecycle,
+    pub datasheet: &'static str,
+}
+
+/// Pure, deterministic part-selection service: maps a [`ComponentClass`] to a concrete
+/// catalog part (P9 — same class always yields the same part). A stand-in for a distributor
+/// lookup; the regulator entry is deliberately [`Eol`](PartLifecycle::Eol) so the BOM
+/// lifecycle gate has something to flag in the end-to-end demo.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PartCatalog;
+
+impl PartCatalog {
+    pub fn new() -> Self {
+        Self
+    }
+
+    /// The catalog part realizing a given component class. Total over `ComponentClass`.
+    pub fn part_for(&self, class: ComponentClass) -> CatalogPart {
+        match class {
+            ComponentClass::Connector => CatalogPart {
+                mpn: "USB4110-GF-A",
+                manufacturer: "GCT",
+                lifecycle: PartLifecycle::Active,
+                datasheet: "https://gct.co/usb4110",
+            },
+            ComponentClass::Ic => CatalogPart {
+                mpn: "STM32L010F4P6",
+                manufacturer: "STMicroelectronics",
+                lifecycle: PartLifecycle::Active,
+                datasheet: "https://st.com/stm32l0",
+            },
+            ComponentClass::Regulator => CatalogPart {
+                mpn: "LM1117-3.3",
+                manufacturer: "Texas Instruments",
+                lifecycle: PartLifecycle::Eol,
+                datasheet: "https://ti.com/lm1117",
+            },
+            ComponentClass::Resistor => CatalogPart {
+                mpn: "RC0402FR-0710KL",
+                manufacturer: "Yageo",
+                lifecycle: PartLifecycle::Active,
+                datasheet: "https://yageo.com/rc0402",
+            },
+            ComponentClass::Capacitor => CatalogPart {
+                mpn: "CL05A104KA5NNNC",
+                manufacturer: "Samsung",
+                lifecycle: PartLifecycle::Active,
+                datasheet: "https://samsung.com/cl05",
+            },
+        }
+    }
+}
+
+// ================================== BOM Rules ==================================
+
+/// BOM rule: every [`Component`] in the schematic must be covered by at least one
+/// [`BomLineItem`] — an uncovered component cannot be ordered (P13). Components are scanned
+/// in slice order for determinism.
+pub struct BomCoverageRule;
+
+impl BomCoverageRule {
+    pub const ID: &'static str = "bom-coverage";
+
+    pub fn new() -> Self {
+        Self
+    }
+}
+impl Default for BomCoverageRule {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Rule for BomCoverageRule {
+    fn id(&self) -> &str {
+        Self::ID
+    }
+
+    fn evaluate(&self, ctx: &VerificationContext) -> Vec<ViolationFinding> {
+        let mut findings = Vec::new();
+        for component in ctx.components.iter() {
+            let covered = ctx
+                .bom_line_items
+                .iter()
+                .any(|item| item.components.contains(&component.id));
+            if !covered {
+                findings.push(ViolationFinding {
+                    rule: Self::ID.to_string(),
+                    severity: ViolationSeverity::Error,
+                    subjects: vec![component.id],
+                    message: format!(
+                        "component \"{}\" ({}) is not covered by any BOM line item",
+                        component.refdes,
+                        component.id.short()
+                    ),
+                });
+            }
+        }
+        findings
+    }
+}
+
+/// BOM rule: a [`BomLineItem`] whose [`Part`] is [`Eol`](PartLifecycle::Eol) is an Error (it
+/// can no longer be sourced); an [`Nrnd`](PartLifecycle::Nrnd) part is a Warning the designer
+/// should heed (P13). Line items are scanned in slice order for determinism. A line whose
+/// part is absent from `ctx.parts` is silently skipped — part-reference integrity is enforced
+/// at the commit seam (P3), not by this rule.
+pub struct BomLifecycleRule;
+
+impl BomLifecycleRule {
+    pub const ID: &'static str = "bom-lifecycle";
+
+    pub fn new() -> Self {
+        Self
+    }
+}
+impl Default for BomLifecycleRule {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Rule for BomLifecycleRule {
+    fn id(&self) -> &str {
+        Self::ID
+    }
+
+    fn evaluate(&self, ctx: &VerificationContext) -> Vec<ViolationFinding> {
+        let mut findings = Vec::new();
+        for item in ctx.bom_line_items.iter() {
+            let Some(part) = ctx.parts.iter().find(|p| p.id == item.part) else {
+                continue;
+            };
+            // One match over the lifecycle: Active lines are fine and skipped; every other
+            // variant maps to its (severity, label) pair. Single source of truth, so there is
+            // no unreachable! arm to drift out of sync on a future refactor.
+            let (severity, state) = match part.lifecycle {
+                PartLifecycle::Eol => (ViolationSeverity::Error, "end-of-life"),
+                PartLifecycle::Nrnd => (
+                    ViolationSeverity::Warning,
+                    "not recommended for new designs",
+                ),
+                PartLifecycle::Active => continue,
+            };
+            findings.push(ViolationFinding {
+                rule: Self::ID.to_string(),
+                severity,
+                subjects: vec![item.id],
+                message: format!(
+                    "BOM line {} orders part \"{}\" which is {}",
+                    item.id.short(),
+                    part.mpn,
+                    state
+                ),
+            });
+        }
+        findings
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -403,6 +574,8 @@ mod tests {
             components: &[],
             pins: &[],
             nets: &[],
+            parts: &[],
+            bom_line_items: &[],
         };
         let findings = rule.evaluate(&ctx);
         assert_eq!(findings.len(), 1);
@@ -426,6 +599,8 @@ mod tests {
             components: &[],
             pins: &[],
             nets: &[],
+            parts: &[],
+            bom_line_items: &[],
         });
         assert_eq!(findings.len(), 1);
     }
@@ -442,6 +617,8 @@ mod tests {
             components: &[],
             pins: &[],
             nets: &[],
+            parts: &[],
+            bom_line_items: &[],
         });
         assert!(findings.is_empty());
     }
@@ -473,6 +650,8 @@ mod tests {
             components: &[],
             pins,
             nets,
+            parts: &[],
+            bom_line_items: &[],
         }
     }
 
@@ -529,5 +708,116 @@ mod tests {
         assert!(ErcPowerNetUndrivenRule::new()
             .evaluate(&erc_ctx(&pins, &nets))
             .is_empty());
+    }
+
+    // ------------------------------ catalog + BOM tests ------------------------------
+
+    fn component(id: u128, class: ComponentClass) -> Component {
+        Component {
+            id: EntityId(id),
+            refdes: format!("U{id}"),
+            class,
+            value: None,
+            from_block: EntityId(800 + id),
+        }
+    }
+
+    fn part(id: u128, lifecycle: PartLifecycle) -> Part {
+        Part {
+            id: EntityId(id),
+            mpn: format!("MPN-{id}"),
+            manufacturer: "ACME".to_string(),
+            lifecycle,
+            datasheet: format!("https://acme/{id}"),
+        }
+    }
+
+    fn line_item(id: u128, part_id: u128, components: Vec<u128>) -> BomLineItem {
+        BomLineItem {
+            id: EntityId(id),
+            part: EntityId(part_id),
+            components: components.into_iter().map(EntityId).collect(),
+            quantity: 1,
+        }
+    }
+
+    fn bom_ctx<'a>(
+        components: &'a [Component],
+        parts: &'a [Part],
+        bom_line_items: &'a [BomLineItem],
+    ) -> VerificationContext<'a> {
+        VerificationContext {
+            requirements: &[],
+            constraints: &[],
+            components,
+            pins: &[],
+            nets: &[],
+            parts,
+            bom_line_items,
+        }
+    }
+
+    #[test]
+    fn catalog_regulator_is_deliberately_eol() {
+        let cat = PartCatalog::new();
+        let reg = cat.part_for(ComponentClass::Regulator);
+        assert_eq!(reg.mpn, "LM1117-3.3");
+        assert_eq!(reg.manufacturer, "Texas Instruments");
+        assert_eq!(reg.lifecycle, PartLifecycle::Eol);
+        assert_eq!(reg.datasheet, "https://ti.com/lm1117");
+        // Active classes stay active.
+        assert_eq!(
+            cat.part_for(ComponentClass::Connector).lifecycle,
+            PartLifecycle::Active
+        );
+        assert_eq!(cat.part_for(ComponentClass::Ic).mpn, "STM32L010F4P6");
+    }
+
+    #[test]
+    fn coverage_rule_flags_uncovered_component() {
+        // C1 is covered; C2 is not.
+        let components = vec![
+            component(1, ComponentClass::Resistor),
+            component(2, ComponentClass::Capacitor),
+        ];
+        let parts = vec![part(50, PartLifecycle::Active)];
+        let items = vec![line_item(60, 50, vec![1])];
+        let findings = BomCoverageRule::new().evaluate(&bom_ctx(&components, &parts, &items));
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule, BomCoverageRule::ID);
+        assert_eq!(findings[0].severity, ViolationSeverity::Error);
+        assert_eq!(findings[0].subjects, vec![EntityId(2)]);
+    }
+
+    #[test]
+    fn lifecycle_rule_flags_eol_line_item() {
+        let components = vec![component(1, ComponentClass::Regulator)];
+        let parts = vec![part(50, PartLifecycle::Eol)];
+        let items = vec![line_item(60, 50, vec![1])];
+        let findings = BomLifecycleRule::new().evaluate(&bom_ctx(&components, &parts, &items));
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule, BomLifecycleRule::ID);
+        assert_eq!(findings[0].severity, ViolationSeverity::Error);
+        assert_eq!(findings[0].subjects, vec![EntityId(60)]);
+        assert!(findings[0].message.contains("MPN-50"));
+    }
+
+    #[test]
+    fn lifecycle_rule_passes_all_active_bom() {
+        let components = vec![component(1, ComponentClass::Resistor)];
+        let parts = vec![part(50, PartLifecycle::Active)];
+        let items = vec![line_item(60, 50, vec![1])];
+        assert!(BomLifecycleRule::new()
+            .evaluate(&bom_ctx(&components, &parts, &items))
+            .is_empty());
+    }
+
+    #[test]
+    fn lifecycle_rule_warns_on_nrnd() {
+        let parts = vec![part(50, PartLifecycle::Nrnd)];
+        let items = vec![line_item(60, 50, vec![1])];
+        let findings = BomLifecycleRule::new().evaluate(&bom_ctx(&[], &parts, &items));
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, ViolationSeverity::Warning);
     }
 }

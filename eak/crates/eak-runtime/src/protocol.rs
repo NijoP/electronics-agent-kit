@@ -5,8 +5,8 @@
 //! via a [`CapabilityRequest`] (P2). Agents never touch state or a model directly.
 
 use eak_domain::{
-    Component, Constraint, Decision, DesignIntent, EntityId, Evidence, FunctionalBlock, Net, Pin,
-    ProvenanceLink, Requirement, Violation, Waiver,
+    BomLineItem, Component, Constraint, Decision, DesignIntent, EntityId, Evidence,
+    FunctionalBlock, Net, Part, Pin, ProvenanceLink, Requirement, Violation, Waiver,
 };
 use eak_ports::{Event, ReasoningError, ReasoningRequest, ReasoningResponse, Seq, StoreError};
 
@@ -85,6 +85,19 @@ pub enum CapabilityRequest {
         net: Net,
         links: Vec<ProvenanceLink>,
     },
+    /// Commit a concrete [`Part`] with its provenance links (Phase 3 BOM). The runtime
+    /// re-validates the part (non-empty manufacturer part number) at the seam.
+    CreatePart {
+        part: Part,
+        links: Vec<ProvenanceLink>,
+    },
+    /// Commit a [`BomLineItem`] binding a part to the components it realizes, with its
+    /// provenance links (Phase 3 BOM). The runtime re-checks quantity/membership and the
+    /// referential integrity of the part and every covered component at the seam.
+    CreateBomLineItem {
+        item: BomLineItem,
+        links: Vec<ProvenanceLink>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,6 +137,10 @@ pub trait AgentContext {
     fn pins(&self) -> Vec<Pin>;
     /// Phase 3: read the committed nets (ERC + schematic IR input).
     fn nets(&self) -> Vec<Net>;
+    /// Phase 3 (BOM): read the committed parts (BOM verification + IR input).
+    fn parts(&self) -> Vec<Part>;
+    /// Phase 3 (BOM): read the committed BOM line items.
+    fn bom_line_items(&self) -> Vec<BomLineItem>;
     /// Call the reasoning engine, record the call (returning its event [`Seq`]), and
     /// return the judgement. Recording here is what makes replay deterministic (P4).
     fn reason(&mut self, req: ReasoningRequest)

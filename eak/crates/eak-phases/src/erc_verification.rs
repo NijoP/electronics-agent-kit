@@ -64,12 +64,16 @@ impl Machine for ErcVerificationMachine {
                 let components = ctx.components();
                 let pins = ctx.pins();
                 let nets = ctx.nets();
+                let parts = ctx.parts();
+                let bom_line_items = ctx.bom_line_items();
                 let findings = engine.run(&VerificationContext {
                     requirements: &requirements,
                     constraints: &constraints,
                     components: &components,
                     pins: &pins,
                     nets: &nets,
+                    parts: &parts,
+                    bom_line_items: &bom_line_items,
                 });
 
                 let existing = ctx.violations();

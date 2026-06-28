@@ -369,6 +369,87 @@ impl Net {
     }
 }
 
+// ===================== Phase 3 (increment 2): BOM entities =====================
+//
+// The bill-of-materials layer binds the abstract [`Component`]s of the schematic to
+// concrete, orderable [`Part`]s. A [`Part`] is a manufacturer part number with its
+// lifecycle state; a [`BomLineItem`] is the first-class binding of one part to the set
+// of components it realizes, with a build quantity. Lifecycle is carried so the BOM gate
+// can flag end-of-life parts (P13: procurement risk is surfaced, never silently shipped).
+// See `docs/engineering/bom-model.md`.
+
+/// Procurement lifecycle of a [`Part`]. An [`Eol`](PartLifecycle::Eol) part can no longer be
+/// sourced and must block; an [`Nrnd`](PartLifecycle::Nrnd) (not-recommended-for-new-designs)
+/// part is a warning the designer should heed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum PartLifecycle {
+    Active,
+    Nrnd,
+    Eol,
+}
+
+/// A concrete, orderable part identified by its manufacturer part number. Bound to the
+/// abstract [`Component`]s it realizes through a [`BomLineItem`], so the BOM stays traceable
+/// back to the schematic (P3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Part {
+    pub id: EntityId,
+    pub mpn: String,
+    pub manufacturer: String,
+    pub lifecycle: PartLifecycle,
+    pub datasheet: String,
+}
+
+impl Part {
+    /// Domain invariant: a part carries a non-empty manufacturer part number — without it
+    /// the part cannot be ordered (P13). Manufacturer/datasheet completeness is a softer
+    /// concern checked downstream, not a hard domain invariant.
+    pub fn validate(&self) -> Result<(), DomainError> {
+        if self.mpn.trim().is_empty() {
+            return Err(DomainError::EmptyField("manufacturer part number"));
+        }
+        Ok(())
+    }
+}
+
+/// A first-class binding of one [`Part`] to the [`Component`]s it realizes, with a build
+/// quantity. Made addressable so BOM findings can name the offending line and trace it back
+/// to both the part and its components (P3, P13). Quantity/component-link integrity is
+/// re-checked at the capability seam.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BomLineItem {
+    pub id: EntityId,
+    /// The part this line orders.
+    pub part: EntityId,
+    /// The component ids this line covers.
+    pub components: Vec<EntityId>,
+    pub quantity: u32,
+}
+
+impl BomLineItem {
+    /// Domain invariants: a line covers at least one component, its quantity equals the
+    /// number of components it covers, and it lists no component twice. Part/component
+    /// existence and cross-line single-sourcing are re-checked at the capability seam (P3).
+    pub fn validate(&self) -> Result<(), DomainError> {
+        if self.components.is_empty() {
+            return Err(DomainError::EmptyField("BOM line item components"));
+        }
+        if self.quantity as usize != self.components.len() {
+            return Err(DomainError::Inconsistent(
+                "BOM line item quantity must equal the number of components it covers",
+            ));
+        }
+        for (i, a) in self.components.iter().enumerate() {
+            if self.components[i + 1..].contains(a) {
+                return Err(DomainError::Inconsistent(
+                    "BOM line item lists a component more than once",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// A violated domain invariant.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DomainError {
@@ -376,6 +457,8 @@ pub enum DomainError {
     /// A named, required text field was blank (carries the field's human label, so the
     /// rejection message is accurate for whichever entity raised it).
     EmptyField(&'static str),
+    /// An entity's fields are internally inconsistent (carries a human explanation).
+    Inconsistent(&'static str),
     AcceptedRequirementNeedsCriterion,
     AcceptedRequirementNeedsSource,
 }
@@ -385,6 +468,7 @@ impl std::fmt::Display for DomainError {
         match self {
             DomainError::EmptyStatement => write!(f, "requirement statement is empty"),
             DomainError::EmptyField(field) => write!(f, "{field} must not be empty"),
+            DomainError::Inconsistent(msg) => write!(f, "{msg}"),
             DomainError::AcceptedRequirementNeedsCriterion => {
                 write!(f, "accepted requirement lacks an acceptance criterion")
             }
@@ -600,5 +684,32 @@ mod tests {
             members: vec![EntityId(2), EntityId(3)],
         };
         assert!(n.validate().is_ok());
+    }
+
+    #[test]
+    fn part_rejects_blank_mpn() {
+        let p = Part {
+            id: EntityId(1),
+            mpn: "   ".into(),
+            manufacturer: "Texas Instruments".into(),
+            lifecycle: PartLifecycle::Active,
+            datasheet: "https://ti.com/lm1117".into(),
+        };
+        assert_eq!(
+            p.validate(),
+            Err(DomainError::EmptyField("manufacturer part number"))
+        );
+    }
+
+    #[test]
+    fn well_formed_part_validates() {
+        let p = Part {
+            id: EntityId(1),
+            mpn: "LM1117-3.3".into(),
+            manufacturer: "Texas Instruments".into(),
+            lifecycle: PartLifecycle::Eol,
+            datasheet: "https://ti.com/lm1117".into(),
+        };
+        assert!(p.validate().is_ok());
     }
 }

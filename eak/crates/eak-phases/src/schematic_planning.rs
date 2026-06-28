@@ -55,6 +55,7 @@ impl Machine for SchematicPlanningMachine {
 
                     // Deterministic per-class reference-designator counters.
                     let mut connector_n = 1u32;
+                    let mut regulator_n = 1u32;
                     let mut ic_n = 1u32;
 
                     for block in &blocks {
@@ -65,7 +66,12 @@ impl Machine for SchematicPlanningMachine {
                                 connector_n += 1;
                                 r
                             }
-                            // Every non-source block is realized as an IC load (Phase 3).
+                            ComponentClass::Regulator => {
+                                let r = format!("VR{regulator_n}");
+                                regulator_n += 1;
+                                r
+                            }
+                            // Every other (non-source) block is realized as an IC load (Phase 3).
                             _ => {
                                 let r = format!("U{ic_n}");
                                 ic_n += 1;
@@ -82,16 +88,29 @@ impl Machine for SchematicPlanningMachine {
                             from_block: block.id,
                         };
 
-                        // Fixed pin template per class: a source exposes a driven rail; a
-                        // load consumes one. Both reference ground.
-                        let pin_specs: [(&str, PinElectricalType); 2] = match class {
-                            ComponentClass::Connector => [
+                        // Fixed pin template per class: a connector source exposes a driven
+                        // rail; a regulator sinks its input and drives its output; a load
+                        // consumes the rail. All reference ground.
+                        let pin_specs: Vec<(&str, PinElectricalType)> = match class {
+                            ComponentClass::Connector => vec![
                                 ("VBUS", PinElectricalType::PowerOut),
                                 ("GND", PinElectricalType::Ground),
                             ],
-                            _ => [
+                            ComponentClass::Regulator => vec![
+                                ("VIN", PinElectricalType::PowerIn),
+                                ("VOUT", PinElectricalType::PowerOut),
+                                ("GND", PinElectricalType::Ground),
+                            ],
+                            ComponentClass::Ic => vec![
                                 ("VDD", PinElectricalType::PowerIn),
                                 ("GND", PinElectricalType::Ground),
+                            ],
+                            // Passives carry two undirected terminals. Defensive: classify()
+                            // does not emit these yet, but the match stays exhaustive so a
+                            // future class can never silently inherit the IC-load template.
+                            ComponentClass::Resistor | ComponentClass::Capacitor => vec![
+                                ("1", PinElectricalType::Passive),
+                                ("2", PinElectricalType::Passive),
                             ],
                         };
                         let pins: Vec<Pin> = pin_specs
@@ -122,6 +141,12 @@ impl Machine for SchematicPlanningMachine {
                     // Join the realized pins into first-class nets (P13: connectivity is
                     // explicit). The power rail collects every source/sink pin; ground every
                     // ground pin. Each net is committed only if it has members.
+                    //
+                    // FIXME(phase-3-scope): this collapses ALL power pins onto one "VBUS" rail,
+                    // so a regulator's VIN and VOUT land on the same net (an input/output short)
+                    // and multi-rail designs are not separated. Per-block / per-voltage-domain
+                    // rail assignment is a later increment; one rail suffices here to exercise
+                    // the ERC driver/sink rules.
                     let pins = ctx.pins();
                     let power_members: Vec<EntityId> = pins
                         .iter()
@@ -177,17 +202,25 @@ impl Machine for SchematicPlanningMachine {
     }
 }
 
-/// Classify a block into a [`ComponentClass`] from its primary requirement (P3): a block is a
-/// power *source* ([`ComponentClass::Connector`]) iff that requirement is functional AND its
-/// wording names a power-entry concept; otherwise it is a load ([`ComponentClass::Ic`]).
+/// Classify a block into a [`ComponentClass`] from its primary requirement (P3). A voltage
+/// regulator/LDO is recognized first ([`ComponentClass::Regulator`]) — its wording names a
+/// regulation concept regardless of category. Otherwise a block is a power *source*
+/// ([`ComponentClass::Connector`]) iff that requirement is functional AND its wording names a
+/// power-entry concept; failing both it is a load ([`ComponentClass::Ic`]).
 fn classify(block: &FunctionalBlock, requirements: &[Requirement]) -> ComponentClass {
     let primary = block
         .requirements
         .first()
         .and_then(|rid| requirements.iter().find(|r| r.id == *rid));
     if let Some(req) = primary {
-        const SOURCE_CUES: [&str; 4] = ["usb", "power", "connector", "supply"];
         let s = req.statement.to_lowercase();
+        // A regulator/LDO takes precedence: it both sinks an upstream rail and drives a
+        // downstream one, so it must not be mistaken for a plain power-entry source.
+        const REGULATOR_CUES: [&str; 3] = ["regulator", "ldo", "voltage regulation"];
+        if REGULATOR_CUES.iter().any(|cue| s.contains(cue)) {
+            return ComponentClass::Regulator;
+        }
+        const SOURCE_CUES: [&str; 4] = ["usb", "power", "connector", "supply"];
         let is_source = req.category == RequirementCategory::Functional
             && SOURCE_CUES.iter().any(|cue| s.contains(cue));
         if is_source {
