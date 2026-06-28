@@ -11,3 +11,6 @@ eak-ports = { workspace = true }
 eak-runtime = { workspace = true }
 eak-engines = { workspace = true }
 eak-compiler = { workspace = true }
+
+[dev-dependencies]
+eak-units = { workspace = true }

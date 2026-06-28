@@ -9,7 +9,7 @@
         "source_hint": "design intent: < 5 W",
         "confidence": 0.92,
         "rationale": "The intent states a 5 W power ceiling.",
-        "targets": []
+        "targets": [{ "magnitude": 5.0, "unit": "Watt", "tolerance": "None" }]
       },
       {
         "statement": "Board outline shall fit within 50 x 50 mm",
@@ -19,7 +19,7 @@
         "source_hint": "design intent: < 50x50 mm",
         "confidence": 0.9,
         "rationale": "The intent states a 50x50 mm size constraint.",
-        "targets": []
+        "targets": [{ "magnitude": 50.0, "unit": "Millimetre", "tolerance": "None" }]
       },
       {
         "statement": "Device shall be powered and enumerate over USB-C",

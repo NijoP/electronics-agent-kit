@@ -15,7 +15,7 @@ pub mod state;
 
 pub use clock::{Clock, IdSource, LogicalClock, SeededIdSource, SystemClock};
 pub use fsm::{ExecutionEngine, Machine, MachineError, PhaseOutcome, StateKind, StepResult};
-pub use orchestrator::{Orchestrator, WorkflowPlan};
+pub use orchestrator::{LoopBack, Orchestrator, WorkflowPlan};
 pub use protocol::{
     Agent, AgentActivation, AgentContext, AgentOutcome, Autonomy, Budget, CapabilityAck,
     CapabilityError, CapabilityRequest,

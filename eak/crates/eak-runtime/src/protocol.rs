@@ -4,7 +4,10 @@
 //! surface through which it may read state, reason (P3), mint ids, and propose mutations
 //! via a [`CapabilityRequest`] (P2). Agents never touch state or a model directly.
 
-use eak_domain::{Decision, DesignIntent, EntityId, Evidence, ProvenanceLink, Requirement};
+use eak_domain::{
+    Constraint, Decision, DesignIntent, EntityId, Evidence, ProvenanceLink, Requirement, Violation,
+    Waiver,
+};
 use eak_ports::{Event, ReasoningError, ReasoningRequest, ReasoningResponse, Seq, StoreError};
 
 /// Autonomy level (P10). Phase 1 exercises `Autonomous`; `Supervised` is modelled but its
@@ -47,6 +50,21 @@ pub enum CapabilityRequest {
         evidence: Vec<Evidence>,
         links: Vec<ProvenanceLink>,
     },
+    /// Commit a [`Constraint`] derived from a requirement, with its provenance links
+    /// (Phase 2). The runtime re-validates (non-empty statement + non-null subject).
+    CreateConstraint {
+        constraint: Constraint,
+        links: Vec<ProvenanceLink>,
+    },
+    /// Raise a [`Violation`] found by the verification engine, with links to the entities
+    /// it implicates so it is traceable to its cause.
+    RaiseViolation {
+        violation: Violation,
+        links: Vec<ProvenanceLink>,
+    },
+    /// Accept an existing violation rather than fix it. The runtime checks the target
+    /// violation exists; folding the event flips it to `Waived`.
+    GrantWaiver { waiver: Waiver },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,6 +92,10 @@ pub trait AgentContext {
     fn design_intent(&self) -> Option<DesignIntent>;
     fn requirements(&self) -> Vec<Requirement>;
     fn provenance_links(&self) -> Vec<ProvenanceLink>;
+    /// Phase 2: read the committed constraints (verification input).
+    fn constraints(&self) -> Vec<Constraint>;
+    /// Phase 2: read the raised violations (so a re-verify can skip duplicates).
+    fn violations(&self) -> Vec<Violation>;
     /// Call the reasoning engine, record the call (returning its event [`Seq`]), and
     /// return the judgement. Recording here is what makes replay deterministic (P4).
     fn reason(&mut self, req: ReasoningRequest)

@@ -6,3 +6,5 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+eak-domain = { workspace = true }
+eak-units = { workspace = true }

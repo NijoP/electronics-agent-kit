@@ -157,6 +157,7 @@ dependencies = [
  "eak-reasoning",
  "eak-runtime",
  "eak-store",
+ "eak-units",
  "serde_json",
 ]
 
@@ -179,6 +180,10 @@ dependencies = [
 [[package]]
 name = "eak-engines"
 version = "0.1.0"
+dependencies = [
+ "eak-domain",
+ "eak-units",
+]
 
 [[package]]
 name = "eak-phases"
@@ -189,6 +194,7 @@ dependencies = [
  "eak-engines",
  "eak-ports",
  "eak-runtime",
+ "eak-units",
 ]
 
 [[package]]

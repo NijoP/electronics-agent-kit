@@ -6,12 +6,15 @@
 //! shell over [`run_cli`].
 
 use eak_domain::RelationType;
-use eak_phases::{EngineeringAnalysisStub, RequirementPlanningMachine};
+use eak_phases::{
+    ConstraintExtractionMachine, ConstraintVerificationMachine, EngineeringAnalysisStub,
+    RequirementPlanningMachine,
+};
 use eak_ports::ReasoningEngine;
 use eak_reasoning::{Cassette, FixtureEngine};
 use eak_runtime::{
-    replay, Autonomy, Clock, LogicalClock, Orchestrator, RuntimeCore, SeededIdSource, SystemClock,
-    WorkflowPlan,
+    replay, Autonomy, Clock, LogicalClock, LoopBack, Orchestrator, RuntimeCore, SeededIdSource,
+    SystemClock, WorkflowPlan,
 };
 use eak_store::FileEventLog;
 use std::path::{Path, PathBuf};
@@ -96,12 +99,22 @@ fn build_reasoning(cfg: &RunConfig) -> Result<Box<dyn ReasoningEngine>, CliError
     }
 }
 
-/// Run Requirement Planning (+ the Engineering Analysis stub) on a design intent. Starts
-/// a fresh event log at `cfg.log`.
+/// Run the default workflow on a design intent, building the reasoning engine from `cfg`.
+/// Starts a fresh event log at `cfg.log`.
 pub fn run(cfg: &RunConfig) -> Result<RunReport, CliError> {
+    let reasoning = build_reasoning(cfg)?;
+    run_with(reasoning, cfg)
+}
+
+/// Run the default workflow with a caller-supplied reasoning engine. Tests use this to
+/// inject a fixture that drives a specific scenario (consistent / contradictory / waived)
+/// without going through cassette files.
+pub fn run_with(
+    reasoning: Box<dyn ReasoningEngine>,
+    cfg: &RunConfig,
+) -> Result<RunReport, CliError> {
     let _ = std::fs::remove_file(&cfg.log); // a run starts a fresh project history
     let log = FileEventLog::open(&cfg.log)?;
-    let reasoning = build_reasoning(cfg)?;
     let ids = Box::new(SeededIdSource::new(cfg.seed));
     let clock: Box<dyn Clock> = if cfg.deterministic_clock {
         Box::new(LogicalClock::new())
@@ -112,10 +125,7 @@ pub fn run(cfg: &RunConfig) -> Result<RunReport, CliError> {
     let mut core = RuntimeCore::new(Box::new(log), reasoning, ids, clock, Autonomy::Autonomous);
     core.capture_intent(&cfg.intent, "engineer")?;
 
-    let mut plan = WorkflowPlan::new(vec![
-        Box::new(RequirementPlanningMachine::new()),
-        Box::new(EngineeringAnalysisStub::new()),
-    ]);
+    let mut plan = default_workflow();
     let outcomes = Orchestrator::new().run(&mut plan, &mut core);
 
     Ok(RunReport {
@@ -123,6 +133,26 @@ pub fn run(cfg: &RunConfig) -> Result<RunReport, CliError> {
         state: core.state.clone(),
         log_path: cfg.log.clone(),
     })
+}
+
+/// The default Phase-2 workflow: Requirement Planning -> Constraint Extraction ->
+/// Constraint Verification -> Engineering Analysis (stub), with the correctness-loop edge
+/// that routes a failed verification back to extraction (bounded retries). Constraint
+/// Extraction is deterministic, so the only reasoning call is still Requirement Planning's.
+fn default_workflow() -> WorkflowPlan {
+    WorkflowPlan::with_loopbacks(
+        vec![
+            Box::new(RequirementPlanningMachine::new()),
+            Box::new(ConstraintExtractionMachine::new()),
+            Box::new(ConstraintVerificationMachine::new()),
+            Box::new(EngineeringAnalysisStub::new()),
+        ],
+        vec![LoopBack {
+            from: "ConstraintVerification".into(),
+            to: "ConstraintExtraction".into(),
+            max_retries: 2,
+        }],
+    )
 }
 
 /// Replay an event log into a reconstructed [`EngineeringState`] (no model, no clock).

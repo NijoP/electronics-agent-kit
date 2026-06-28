@@ -10,7 +10,8 @@
 //! the "a contract lives with the ring that needs it" rule they belong to the kernel.
 
 use eak_domain::{
-    Decision, DesignIntent, Evidence, Priority, ProvenanceLink, Requirement, RequirementCategory,
+    Constraint, Decision, DesignIntent, Evidence, Priority, ProvenanceLink, Requirement,
+    RequirementCategory, Violation, Waiver,
 };
 use eak_units::PhysicalQuantity;
 use serde::{Deserialize, Serialize};
@@ -79,6 +80,26 @@ pub enum Event {
     },
     ProvenanceLinked {
         link: ProvenanceLink,
+    },
+
+    // ---- Phase 2: verification state deltas ----
+    ConstraintCommitted {
+        constraint: Constraint,
+    },
+    ViolationRaised {
+        violation: Violation,
+    },
+    WaiverGranted {
+        waiver: Waiver,
+    },
+
+    // ---- Phase 2: verification milestones (audit) ----
+    ConstraintsExtracted {
+        count: usize,
+    },
+    VerificationCompleted {
+        rule_count: usize,
+        open_violations: usize,
     },
 
     // ---- IR boundary milestones (audit) ----

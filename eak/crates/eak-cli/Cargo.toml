@@ -19,5 +19,8 @@ eak-phases = { workspace = true }
 eak-reasoning = { workspace = true }
 eak-store = { workspace = true }
 
+[dev-dependencies]
+eak-units = { workspace = true }
+
 [features]
 live = ["eak-reasoning/live"]

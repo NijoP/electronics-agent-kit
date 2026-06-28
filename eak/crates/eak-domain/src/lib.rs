@@ -141,6 +141,113 @@ pub struct ProvenanceLink {
     pub relation: RelationType,
 }
 
+// ===================== Phase 2: verification entities =====================
+//
+// Phase 2 adds the machine-checkable layer on top of the Phase-1 intent layer: a
+// [`Constraint`] is a typed bound derived from a [`Requirement`]'s physical target; a
+// [`Violation`] is a first-class, addressed breach of a verification rule; a [`Waiver`]
+// is the recorded decision to accept a violation. See
+// `docs/engineering/constraint-engine.md` and `docs/engineering/verification-engine.md`.
+
+/// Comparison sense of a [`Constraint`]'s bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ConstraintKind {
+    /// The subject value must not exceed the bound (e.g. "power <= 5 W").
+    Max,
+    /// The subject value must be at least the bound (e.g. "power >= 8 W").
+    Min,
+    /// The subject value must equal the bound.
+    Equal,
+}
+
+/// Lifecycle of a [`Constraint`]. Constraints are never deleted, only superseded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ConstraintStatus {
+    Active,
+    Superseded,
+}
+
+/// A machine-checkable bound on a [`Requirement`]'s physical target (P9). Derived from a
+/// requirement, never authored directly; carries the unit so verification is dimensionally
+/// unambiguous.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Constraint {
+    pub id: EntityId,
+    pub statement: String,
+    /// The requirement this constraint bounds.
+    pub subject_requirement: EntityId,
+    pub kind: ConstraintKind,
+    pub bound: PhysicalQuantity,
+    /// The entity (usually the subject requirement) this constraint derives from.
+    pub source: EntityId,
+    pub status: ConstraintStatus,
+}
+
+impl Constraint {
+    pub fn is_active(&self) -> bool {
+        self.status == ConstraintStatus::Active
+    }
+
+    /// Domain invariant: a constraint carries a non-empty statement (reuses
+    /// [`DomainError::EmptyStatement`]). The null-subject check lives in the capability
+    /// handler, so no new error variant is needed.
+    pub fn validate(&self) -> Result<(), DomainError> {
+        if self.statement.trim().is_empty() {
+            return Err(DomainError::EmptyStatement);
+        }
+        Ok(())
+    }
+}
+
+/// How serious a [`Violation`] is. Only [`ViolationSeverity::Error`] can block a workflow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ViolationSeverity {
+    Error,
+    Warning,
+    Info,
+}
+
+/// Lifecycle of a [`Violation`]. An [`Open`](ViolationStatus::Open) error blocks; a
+/// [`Waived`](ViolationStatus::Waived) or [`Resolved`](ViolationStatus::Resolved) one does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ViolationStatus {
+    Open,
+    Waived,
+    Resolved,
+}
+
+/// A detected breach of a verification rule, made first-class so it is addressed and fully
+/// traceable to its cause via [`Violation::subjects`] + provenance links.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Violation {
+    pub id: EntityId,
+    /// Stable identifier of the rule that raised it (e.g. `"constraint-consistency"`).
+    pub rule: String,
+    pub severity: ViolationSeverity,
+    /// The entities implicated (constraints, requirements, ...). The traceability anchor.
+    pub subjects: Vec<EntityId>,
+    pub message: String,
+    pub status: ViolationStatus,
+}
+
+impl Violation {
+    /// A violation blocks a workflow iff it is an unaddressed error (P13: failures are
+    /// explicit, never silently dropped).
+    pub fn is_blocking(&self) -> bool {
+        self.severity == ViolationSeverity::Error && self.status == ViolationStatus::Open
+    }
+}
+
+/// A recorded decision to accept a [`Violation`] rather than fix it (P5: every
+/// design-significant change is justified; P10: the human/agent who decided is named).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Waiver {
+    pub id: EntityId,
+    pub violation: EntityId,
+    pub justification: String,
+    pub decided_by: String,
+}
+
 /// A violated domain invariant.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DomainError {
@@ -246,5 +353,52 @@ mod tests {
     fn entity_id_null_is_reserved() {
         assert!(EntityId::NULL.is_null());
         assert!(!EntityId(1).is_null());
+    }
+
+    #[test]
+    fn constraint_rejects_empty_statement() {
+        let c = Constraint {
+            id: EntityId(1),
+            statement: "   ".into(),
+            subject_requirement: EntityId(2),
+            kind: ConstraintKind::Max,
+            bound: PhysicalQuantity::new(5.0, eak_units::Unit::Watt),
+            source: EntityId(2),
+            status: ConstraintStatus::Active,
+        };
+        assert_eq!(c.validate(), Err(DomainError::EmptyStatement));
+    }
+
+    #[test]
+    fn well_formed_constraint_validates_and_is_active() {
+        let c = Constraint {
+            id: EntityId(1),
+            statement: "power <= 5 W".into(),
+            subject_requirement: EntityId(2),
+            kind: ConstraintKind::Max,
+            bound: PhysicalQuantity::new(5.0, eak_units::Unit::Watt),
+            source: EntityId(2),
+            status: ConstraintStatus::Active,
+        };
+        assert!(c.validate().is_ok());
+        assert!(c.is_active());
+    }
+
+    #[test]
+    fn only_open_error_violations_block() {
+        let mut v = Violation {
+            id: EntityId(1),
+            rule: "constraint-consistency".into(),
+            severity: ViolationSeverity::Error,
+            subjects: vec![EntityId(2), EntityId(3)],
+            message: "contradictory bounds".into(),
+            status: ViolationStatus::Open,
+        };
+        assert!(v.is_blocking());
+        v.status = ViolationStatus::Waived;
+        assert!(!v.is_blocking());
+        v.status = ViolationStatus::Open;
+        v.severity = ViolationSeverity::Warning;
+        assert!(!v.is_blocking());
     }
 }
