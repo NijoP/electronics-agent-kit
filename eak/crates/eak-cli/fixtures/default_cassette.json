@@ -1,0 +1,38 @@
+{
+  "default": {
+    "candidates": [
+      {
+        "statement": "Operating power shall not exceed 5 W",
+        "category": "Electrical",
+        "priority": "High",
+        "acceptance_criterion": "Measured total input power under nominal load is < 5 W",
+        "source_hint": "design intent: < 5 W",
+        "confidence": 0.92,
+        "rationale": "The intent states a 5 W power ceiling.",
+        "targets": []
+      },
+      {
+        "statement": "Board outline shall fit within 50 x 50 mm",
+        "category": "Mechanical",
+        "priority": "High",
+        "acceptance_criterion": "Maximum board extent <= 50 mm on each axis",
+        "source_hint": "design intent: < 50x50 mm",
+        "confidence": 0.9,
+        "rationale": "The intent states a 50x50 mm size constraint.",
+        "targets": []
+      },
+      {
+        "statement": "Device shall be powered and enumerate over USB-C",
+        "category": "Functional",
+        "priority": "High",
+        "acceptance_criterion": "A USB-C receptacle is present and the device enumerates when connected",
+        "source_hint": "design intent: USB-C",
+        "confidence": 0.88,
+        "rationale": "The intent names USB-C as the interface.",
+        "targets": []
+      }
+    ],
+    "clarifying_questions": [],
+    "raw": "fixture"
+  }
+}

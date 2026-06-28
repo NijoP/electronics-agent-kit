@@ -1,0 +1,13 @@
+[package]
+name = "eak-phases"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+eak-domain = { workspace = true }
+eak-ports = { workspace = true }
+eak-runtime = { workspace = true }
+eak-engines = { workspace = true }
+eak-compiler = { workspace = true }

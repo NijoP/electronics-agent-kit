@@ -1,0 +1,3 @@
+# Rust build artifacts
+eak/target/
+**/*.rs.bk

@@ -1,0 +1,23 @@
+[package]
+name = "eak-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "eak"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true }
+serde_json = { workspace = true }
+eak-domain = { workspace = true }
+eak-ports = { workspace = true }
+eak-runtime = { workspace = true }
+eak-phases = { workspace = true }
+eak-reasoning = { workspace = true }
+eak-store = { workspace = true }
+
+[features]
+live = ["eak-reasoning/live"]

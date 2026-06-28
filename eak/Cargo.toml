@@ -1,0 +1,30 @@
+# Electronics Agent Kit — Phase 1 workspace.
+# Crates map 1:1 to the clean-architecture rings (docs/foundation/principles.md, P1).
+# Dependency edges point ONLY inward; the kernel (eak-runtime) never depends on an
+# adapter crate. Cargo forbids dependency cycles, so the ring structure is enforced
+# at compile time. See docs/decisions/0011-*.md.
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+rust-version = "1.74"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+ureq = "2"
+
+eak-units = { path = "crates/eak-units" }
+eak-domain = { path = "crates/eak-domain" }
+eak-ports = { path = "crates/eak-ports" }
+eak-runtime = { path = "crates/eak-runtime" }
+eak-engines = { path = "crates/eak-engines" }
+eak-compiler = { path = "crates/eak-compiler" }
+eak-phases = { path = "crates/eak-phases" }
+eak-store = { path = "crates/eak-store" }
+eak-reasoning = { path = "crates/eak-reasoning" }

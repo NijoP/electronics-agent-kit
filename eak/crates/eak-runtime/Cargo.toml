@@ -1,0 +1,12 @@
+[package]
+name = "eak-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+eak-domain = { workspace = true }
+eak-ports = { workspace = true }
