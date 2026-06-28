@@ -5,8 +5,8 @@
 //! run and during [`crate::replay`], guaranteeing identical reconstruction.
 
 use eak_domain::{
-    Constraint, Decision, DesignIntent, EntityId, Evidence, ProvenanceLink, Requirement, Violation,
-    ViolationStatus, Waiver,
+    Component, Constraint, Decision, DesignIntent, EntityId, Evidence, FunctionalBlock, Net, Pin,
+    ProvenanceLink, Requirement, Violation, ViolationStatus, Waiver,
 };
 use eak_ports::Event;
 use serde::{Deserialize, Serialize};
@@ -24,6 +24,11 @@ pub struct EngineeringState {
     pub constraints: Vec<Constraint>,
     pub violations: Vec<Violation>,
     pub waivers: Vec<Waiver>,
+    // Phase 3: the synthesis (realization) layer beneath verification.
+    pub functional_blocks: Vec<FunctionalBlock>,
+    pub components: Vec<Component>,
+    pub pins: Vec<Pin>,
+    pub nets: Vec<Net>,
 }
 
 impl EngineeringState {
@@ -56,6 +61,13 @@ impl EngineeringState {
                 }
                 self.waivers.push(waiver.clone());
             }
+            Event::FunctionalBlockCommitted { block } => self.functional_blocks.push(block.clone()),
+            Event::ComponentCommitted { component } => self.components.push(component.clone()),
+            Event::PinCommitted { pin } => self.pins.push(pin.clone()),
+            Event::NetCommitted { net } => self.nets.push(net.clone()),
+            // Audit-only events (phase lifecycle, reasoning calls, IR-boundary milestones)
+            // carry no state and are intentionally not folded. AUDIT: any NEW state-bearing
+            // event variant MUST get an explicit arm above, or replay will silently diverge.
             _ => {}
         }
     }
@@ -78,6 +90,22 @@ impl EngineeringState {
 
     pub fn violation(&self, id: EntityId) -> Option<&Violation> {
         self.violations.iter().find(|v| v.id == id)
+    }
+
+    pub fn functional_block(&self, id: EntityId) -> Option<&FunctionalBlock> {
+        self.functional_blocks.iter().find(|b| b.id == id)
+    }
+
+    pub fn component(&self, id: EntityId) -> Option<&Component> {
+        self.components.iter().find(|c| c.id == id)
+    }
+
+    pub fn pin(&self, id: EntityId) -> Option<&Pin> {
+        self.pins.iter().find(|p| p.id == id)
+    }
+
+    pub fn net(&self, id: EntityId) -> Option<&Net> {
+        self.nets.iter().find(|n| n.id == id)
     }
 
     /// Open, blocking (error-severity) violations — the workflow gate (P13).

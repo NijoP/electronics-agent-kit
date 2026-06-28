@@ -9,8 +9,8 @@ use crate::clock::{Clock, IdSource};
 use crate::protocol::{AgentContext, Autonomy, CapabilityAck, CapabilityError, CapabilityRequest};
 use crate::state::EngineeringState;
 use eak_domain::{
-    Constraint, Decision, DesignIntent, EntityId, Evidence, ProvenanceLink, Requirement, Violation,
-    Waiver,
+    Component, Constraint, Decision, DesignIntent, EntityId, Evidence, FunctionalBlock, Net, Pin,
+    ProvenanceLink, Requirement, Violation, Waiver,
 };
 use eak_ports::{
     Event, EventLog, ReasoningEngine, ReasoningError, ReasoningRequest, ReasoningResponse, Seq,
@@ -127,6 +127,18 @@ impl RuntimeCore {
                 "constraint has no subject requirement".into(),
             ));
         }
+        // Referential integrity at the seam: the subject must be a committed requirement,
+        // so a constraint can never dangle (P3, P5).
+        if self
+            .state
+            .requirement(constraint.subject_requirement)
+            .is_none()
+        {
+            return Err(CapabilityError::Rejected(format!(
+                "constraint subject requirement {} does not exist",
+                constraint.subject_requirement.short()
+            )));
+        }
 
         let mut events = vec![Event::ConstraintCommitted { constraint }];
         for link in links {
@@ -182,6 +194,120 @@ impl RuntimeCore {
             .map_err(|e| CapabilityError::Rejected(e.to_string()))?;
         Ok(CapabilityAck { committed: seqs })
     }
+
+    fn handle_create_functional_block(
+        &mut self,
+        block: FunctionalBlock,
+        links: Vec<ProvenanceLink>,
+    ) -> Result<CapabilityAck, CapabilityError> {
+        // The seam (P3): re-validate the block and its requirement links before committing.
+        block
+            .validate()
+            .map_err(|e| CapabilityError::Rejected(e.to_string()))?;
+        // A block that realizes no requirement is untraceable to intent (P3) — reject it.
+        if block.requirements.is_empty() {
+            return Err(CapabilityError::Rejected(
+                "functional block realizes no requirement (would be untraceable)".into(),
+            ));
+        }
+        // Referential integrity at the seam: every referenced requirement must exist, so
+        // the block-to-requirement trace can never dangle (P3, P5).
+        for rid in &block.requirements {
+            if self.state.requirement(*rid).is_none() {
+                return Err(CapabilityError::Rejected(format!(
+                    "functional block references unknown requirement {}",
+                    rid.short()
+                )));
+            }
+        }
+
+        let mut events = vec![Event::FunctionalBlockCommitted { block }];
+        for link in links {
+            events.push(Event::ProvenanceLinked { link });
+        }
+        let seqs = self
+            .commit(events)
+            .map_err(|e| CapabilityError::Rejected(e.to_string()))?;
+        Ok(CapabilityAck { committed: seqs })
+    }
+
+    fn handle_realize_component(
+        &mut self,
+        component: Component,
+        pins: Vec<Pin>,
+        links: Vec<ProvenanceLink>,
+    ) -> Result<CapabilityAck, CapabilityError> {
+        // The seam (P3): re-validate the component and its originating block before committing.
+        component
+            .validate()
+            .map_err(|e| CapabilityError::Rejected(e.to_string()))?;
+        // A component minted from no block is untraceable to intent (P3) — reject it.
+        if component.from_block == EntityId::NULL {
+            return Err(CapabilityError::Rejected(
+                "component has no originating functional block".into(),
+            ));
+        }
+        // Referential integrity at the seam: the originating block must exist (P3, P5).
+        if self.state.functional_block(component.from_block).is_none() {
+            return Err(CapabilityError::Rejected(format!(
+                "component originates from unknown functional block {}",
+                component.from_block.short()
+            )));
+        }
+        // A component with no pins can never join a net and would pass every ERC rule
+        // vacuously — reject it (P13: no silently-inert entities).
+        if pins.is_empty() {
+            return Err(CapabilityError::Rejected("component has no pins".into()));
+        }
+
+        // One atomic realization: the component, then a pin event each, then the links.
+        let mut events = vec![Event::ComponentCommitted { component }];
+        for pin in pins {
+            events.push(Event::PinCommitted { pin });
+        }
+        for link in links {
+            events.push(Event::ProvenanceLinked { link });
+        }
+        let seqs = self
+            .commit(events)
+            .map_err(|e| CapabilityError::Rejected(e.to_string()))?;
+        Ok(CapabilityAck { committed: seqs })
+    }
+
+    fn handle_create_net(
+        &mut self,
+        net: Net,
+        links: Vec<ProvenanceLink>,
+    ) -> Result<CapabilityAck, CapabilityError> {
+        // The seam (P3): re-validate the net and its membership before committing.
+        net.validate()
+            .map_err(|e| CapabilityError::Rejected(e.to_string()))?;
+        // A net joining no pins carries no connectivity — reject it (P13).
+        if net.members.is_empty() {
+            return Err(CapabilityError::Rejected(
+                "net joins no pins (carries no connectivity)".into(),
+            ));
+        }
+        // Referential integrity at the seam: every member must be a committed pin, so
+        // connectivity can never reference a phantom terminal (P3, P5).
+        for pid in &net.members {
+            if self.state.pin(*pid).is_none() {
+                return Err(CapabilityError::Rejected(format!(
+                    "net references unknown pin {}",
+                    pid.short()
+                )));
+            }
+        }
+
+        let mut events = vec![Event::NetCommitted { net }];
+        for link in links {
+            events.push(Event::ProvenanceLinked { link });
+        }
+        let seqs = self
+            .commit(events)
+            .map_err(|e| CapabilityError::Rejected(e.to_string()))?;
+        Ok(CapabilityAck { committed: seqs })
+    }
 }
 
 impl AgentContext for RuntimeCore {
@@ -211,6 +337,22 @@ impl AgentContext for RuntimeCore {
 
     fn violations(&self) -> Vec<Violation> {
         self.state.violations.clone()
+    }
+
+    fn functional_blocks(&self) -> Vec<FunctionalBlock> {
+        self.state.functional_blocks.clone()
+    }
+
+    fn components(&self) -> Vec<Component> {
+        self.state.components.clone()
+    }
+
+    fn pins(&self) -> Vec<Pin> {
+        self.state.pins.clone()
+    }
+
+    fn nets(&self) -> Vec<Net> {
+        self.state.nets.clone()
     }
 
     fn reason(
@@ -245,6 +387,15 @@ impl AgentContext for RuntimeCore {
                 self.handle_raise_violation(violation, links)
             }
             CapabilityRequest::GrantWaiver { waiver } => self.handle_grant_waiver(waiver),
+            CapabilityRequest::CreateFunctionalBlock { block, links } => {
+                self.handle_create_functional_block(block, links)
+            }
+            CapabilityRequest::RealizeComponent {
+                component,
+                pins,
+                links,
+            } => self.handle_realize_component(component, pins, links),
+            CapabilityRequest::CreateNet { net, links } => self.handle_create_net(net, links),
         }
     }
 

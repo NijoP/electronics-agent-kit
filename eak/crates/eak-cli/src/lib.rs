@@ -7,8 +7,8 @@
 
 use eak_domain::RelationType;
 use eak_phases::{
-    ConstraintExtractionMachine, ConstraintVerificationMachine, EngineeringAnalysisStub,
-    RequirementPlanningMachine,
+    ConstraintExtractionMachine, ConstraintVerificationMachine, EngineeringAnalysisMachine,
+    ErcVerificationMachine, RequirementPlanningMachine, SchematicPlanningMachine,
 };
 use eak_ports::ReasoningEngine;
 use eak_reasoning::{Cassette, FixtureEngine};
@@ -135,23 +135,41 @@ pub fn run_with(
     })
 }
 
-/// The default Phase-2 workflow: Requirement Planning -> Constraint Extraction ->
-/// Constraint Verification -> Engineering Analysis (stub), with the correctness-loop edge
-/// that routes a failed verification back to extraction (bounded retries). Constraint
-/// Extraction is deterministic, so the only reasoning call is still Requirement Planning's.
+/// The default Phase-3 workflow: Requirement Planning -> Engineering Analysis ->
+/// Constraint Extraction -> Constraint Verification -> Schematic Planning -> ERC
+/// Verification. Only Requirement Planning reasons (P3); every other phase here is
+/// deterministic, so a run replays bit-identically (P4).
+///
+/// Two correctness-loop edges bound the self-correction: a failed constraint verification
+/// routes back to extraction, and a failed ERC routes back to schematic planning (each
+/// capped at `max_retries` 2). Because extraction and schematic planning are *idempotent*
+/// (a re-entry produces the identical artifact), the loop is a no-op recovery for a design
+/// that is genuinely infeasible: it deterministically exhausts the retries and then surfaces
+/// the open, blocking violation rather than looping forever (P13). The loop-back is the seam
+/// where a future reasoning-assisted re-synthesis (or a human waiver between passes) can
+/// actually change the artifact and clear the violation.
 fn default_workflow() -> WorkflowPlan {
     WorkflowPlan::with_loopbacks(
         vec![
             Box::new(RequirementPlanningMachine::new()),
+            Box::new(EngineeringAnalysisMachine::new()),
             Box::new(ConstraintExtractionMachine::new()),
             Box::new(ConstraintVerificationMachine::new()),
-            Box::new(EngineeringAnalysisStub::new()),
+            Box::new(SchematicPlanningMachine::new()),
+            Box::new(ErcVerificationMachine::new()),
         ],
-        vec![LoopBack {
-            from: "ConstraintVerification".into(),
-            to: "ConstraintExtraction".into(),
-            max_retries: 2,
-        }],
+        vec![
+            LoopBack {
+                from: "ConstraintVerification".into(),
+                to: "ConstraintExtraction".into(),
+                max_retries: 2,
+            },
+            LoopBack {
+                from: "ErcVerification".into(),
+                to: "SchematicPlanning".into(),
+                max_retries: 2,
+            },
+        ],
     )
 }
 

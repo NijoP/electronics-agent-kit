@@ -5,13 +5,17 @@ pub mod agent;
 pub mod constraint_extraction;
 pub mod constraint_verification;
 pub mod engineering_analysis;
+pub mod erc_verification;
 pub mod requirement_planning;
+pub mod schematic_planning;
 
 pub use agent::RequirementAgent;
 pub use constraint_extraction::ConstraintExtractionMachine;
 pub use constraint_verification::ConstraintVerificationMachine;
-pub use engineering_analysis::EngineeringAnalysisStub;
+pub use engineering_analysis::EngineeringAnalysisMachine;
+pub use erc_verification::ErcVerificationMachine;
 pub use requirement_planning::RequirementPlanningMachine;
+pub use schematic_planning::SchematicPlanningMachine;
 
 #[cfg(test)]
 mod tests {
@@ -122,7 +126,7 @@ mod tests {
             .unwrap();
         let mut plan = WorkflowPlan::new(vec![
             Box::new(RequirementPlanningMachine::new()),
-            Box::new(EngineeringAnalysisStub::new()),
+            Box::new(EngineeringAnalysisMachine::new()),
         ]);
         let results = Orchestrator::new().run(&mut plan, &mut core);
         assert_eq!(results.len(), 2);
@@ -295,6 +299,164 @@ mod tests {
         // violation is raised and nothing blocks — the phase now passes.
         let mut verify = ConstraintVerificationMachine::new();
         let outcome = ExecutionEngine::new().run(&mut verify, &mut core);
+        assert_eq!(outcome, PhaseOutcome::Success);
+        assert_eq!(core.state.violations.len(), 1); // no duplicate raised
+        assert_eq!(core.state.waivers.len(), 1);
+
+        // replay identity holds across raise + waive + re-verify.
+        let replayed = replay(core.log()).unwrap();
+        assert_eq!(core.state, replayed);
+    }
+
+    /// A reasoner that yields a functional power-entry requirement (a connector/source) plus
+    /// an electrical load, so Schematic Planning synthesizes a driven power rail.
+    struct SourcedReasoner;
+    impl ReasoningEngine for SourcedReasoner {
+        fn model_id(&self) -> String {
+            "sourced".into()
+        }
+        fn request_judgement(
+            &self,
+            _req: &ReasoningRequest,
+        ) -> Result<ReasoningResponse, ReasoningError> {
+            use eak_units::{PhysicalQuantity, Unit};
+            Ok(ReasoningResponse {
+                candidates: vec![
+                    CandidateRequirement {
+                        statement: "USB-C connector shall supply 5 V to the board".into(),
+                        category: RequirementCategory::Functional,
+                        priority: Priority::High,
+                        acceptance_criterion: "VBUS present at 5 V".into(),
+                        source_hint: "intent: USB-C power entry".into(),
+                        confidence: 0.9,
+                        rationale: "power entry".into(),
+                        targets: vec![],
+                    },
+                    CandidateRequirement {
+                        statement: "Operating power shall not exceed 5 W".into(),
+                        category: RequirementCategory::Electrical,
+                        priority: Priority::High,
+                        acceptance_criterion: "measured input power < 5 W".into(),
+                        source_hint: "intent: < 5 W".into(),
+                        confidence: 0.9,
+                        rationale: "power budget".into(),
+                        targets: vec![PhysicalQuantity::new(5.0, Unit::Watt)],
+                    },
+                ],
+                clarifying_questions: vec![],
+                raw: "{}".into(),
+            })
+        }
+    }
+
+    #[test]
+    fn happy_end_to_end_synthesizes_clean_schematic() {
+        let mut core = RuntimeCore::new(
+            Box::new(MemLog { records: vec![] }),
+            Box::new(SourcedReasoner),
+            Box::new(SeededIdSource::new(7)),
+            Box::new(LogicalClock::new()),
+            Autonomy::Autonomous,
+        );
+        core.capture_intent("USB-C powered sensor node, < 5 W", "engineer")
+            .unwrap();
+
+        // The full Phase-3 chain, run linearly (each phase succeeds, so no loop-back fires).
+        let mut plan = WorkflowPlan::new(vec![
+            Box::new(RequirementPlanningMachine::new()),
+            Box::new(EngineeringAnalysisMachine::new()),
+            Box::new(ConstraintExtractionMachine::new()),
+            Box::new(ConstraintVerificationMachine::new()),
+            Box::new(SchematicPlanningMachine::new()),
+            Box::new(ErcVerificationMachine::new()),
+        ]);
+        let results = Orchestrator::new().run(&mut plan, &mut core);
+
+        assert_eq!(results.len(), 6);
+        assert!(results.iter().all(|(_, o)| *o == PhaseOutcome::Success));
+        // Architecture, realization, and connectivity all exist and the ERC is clean.
+        assert!(!core.state.functional_blocks.is_empty());
+        assert!(!core.state.components.is_empty());
+        assert!(!core.state.nets.is_empty());
+        assert!(core.state.violations.is_empty());
+
+        // replay identity holds across the whole Phase-3 run.
+        let replayed = replay(core.log()).unwrap();
+        assert_eq!(core.state, replayed);
+    }
+
+    /// A reasoner whose only candidate is an electrical load with no power-entry wording, so
+    /// Schematic Planning realizes a consumer with no source — an undriven power net.
+    struct LoadOnlyReasoner;
+    impl ReasoningEngine for LoadOnlyReasoner {
+        fn model_id(&self) -> String {
+            "load-only".into()
+        }
+        fn request_judgement(
+            &self,
+            _req: &ReasoningRequest,
+        ) -> Result<ReasoningResponse, ReasoningError> {
+            Ok(ReasoningResponse {
+                candidates: vec![CandidateRequirement {
+                    statement: "Microcontroller shall run the sensing firmware".into(),
+                    category: RequirementCategory::Electrical,
+                    priority: Priority::High,
+                    acceptance_criterion: "firmware boots and samples".into(),
+                    source_hint: "intent: sensing load".into(),
+                    confidence: 0.9,
+                    rationale: "compute load".into(),
+                    targets: vec![],
+                }],
+                clarifying_questions: vec![],
+                raw: "{}".into(),
+            })
+        }
+    }
+
+    #[test]
+    fn erc_waiver_lets_reverification_pass() {
+        let mut core = RuntimeCore::new(
+            Box::new(MemLog { records: vec![] }),
+            Box::new(LoadOnlyReasoner),
+            Box::new(SeededIdSource::new(7)),
+            Box::new(LogicalClock::new()),
+            Autonomy::Autonomous,
+        );
+        core.capture_intent("battery-only sensor node", "engineer")
+            .unwrap();
+
+        // One linear pass: requirements -> architecture -> schematic -> ERC. The load's power
+        // rail has no driver, so ERC fails with one open, blocking violation.
+        let mut plan = WorkflowPlan::new(vec![
+            Box::new(RequirementPlanningMachine::new()),
+            Box::new(EngineeringAnalysisMachine::new()),
+            Box::new(SchematicPlanningMachine::new()),
+            Box::new(ErcVerificationMachine::new()),
+        ]);
+        let results = Orchestrator::new().run(&mut plan, &mut core);
+        assert!(matches!(results.last().unwrap().1, PhaseOutcome::Failed(_)));
+        assert_eq!(core.state.violations.len(), 1);
+        assert!(core.state.violations[0].is_blocking());
+
+        // Accept the violation via the only write path — the Capability port (P2).
+        let vid = core.state.violations[0].id;
+        let wid = core.fresh_id();
+        core.invoke(CapabilityRequest::GrantWaiver {
+            waiver: Waiver {
+                id: wid,
+                violation: vid,
+                justification: "battery-powered prototype: VBUS net left unpopulated".into(),
+                decided_by: "engineer".into(),
+            },
+        })
+        .expect("waiver granted");
+        assert_eq!(core.state.violations[0].status, ViolationStatus::Waived);
+        assert!(!core.state.violations[0].is_blocking());
+
+        // Re-verify ERC: the undriven net is still found, but the violation is waived, so no
+        // new violation is raised and nothing blocks — the phase now passes.
+        let mut erc = ErcVerificationMachine::new();
+        let outcome = ExecutionEngine::new().run(&mut erc, &mut core);
         assert_eq!(outcome, PhaseOutcome::Success);
         assert_eq!(core.state.violations.len(), 1); // no duplicate raised
         assert_eq!(core.state.waivers.len(), 1);

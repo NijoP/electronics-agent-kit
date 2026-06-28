@@ -5,8 +5,8 @@
 //! via a [`CapabilityRequest`] (P2). Agents never touch state or a model directly.
 
 use eak_domain::{
-    Constraint, Decision, DesignIntent, EntityId, Evidence, ProvenanceLink, Requirement, Violation,
-    Waiver,
+    Component, Constraint, Decision, DesignIntent, EntityId, Evidence, FunctionalBlock, Net, Pin,
+    ProvenanceLink, Requirement, Violation, Waiver,
 };
 use eak_ports::{Event, ReasoningError, ReasoningRequest, ReasoningResponse, Seq, StoreError};
 
@@ -65,6 +65,26 @@ pub enum CapabilityRequest {
     /// Accept an existing violation rather than fix it. The runtime checks the target
     /// violation exists; folding the event flips it to `Waived`.
     GrantWaiver { waiver: Waiver },
+    /// Commit a [`FunctionalBlock`] together with its provenance links (Phase 3). The
+    /// runtime re-validates (non-empty name + at least one realized requirement) at the seam.
+    CreateFunctionalBlock {
+        block: FunctionalBlock,
+        links: Vec<ProvenanceLink>,
+    },
+    /// Realize a [`Component`] with its [`Pin`]s and provenance links (Phase 3). The runtime
+    /// re-validates the component (non-empty refdes + a non-null originating block), then
+    /// commits the component, one event per pin, and the links — one atomic realization.
+    RealizeComponent {
+        component: Component,
+        pins: Vec<Pin>,
+        links: Vec<ProvenanceLink>,
+    },
+    /// Commit a [`Net`] joining pins, with its provenance links (Phase 3). The runtime
+    /// re-validates (non-empty name + at least one member pin) at the seam.
+    CreateNet {
+        net: Net,
+        links: Vec<ProvenanceLink>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,6 +116,14 @@ pub trait AgentContext {
     fn constraints(&self) -> Vec<Constraint>;
     /// Phase 2: read the raised violations (so a re-verify can skip duplicates).
     fn violations(&self) -> Vec<Violation>;
+    /// Phase 3: read the committed functional blocks (synthesis input).
+    fn functional_blocks(&self) -> Vec<FunctionalBlock>;
+    /// Phase 3: read the realized components.
+    fn components(&self) -> Vec<Component>;
+    /// Phase 3: read the realized pins.
+    fn pins(&self) -> Vec<Pin>;
+    /// Phase 3: read the committed nets (ERC + schematic IR input).
+    fn nets(&self) -> Vec<Net>;
     /// Call the reasoning engine, record the call (returning its event [`Seq`]), and
     /// return the judgement. Recording here is what makes replay deterministic (P4).
     fn reason(&mut self, req: ReasoningRequest)

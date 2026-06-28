@@ -82,15 +82,14 @@ impl Machine for ConstraintExtractionMachine {
                         to: req.id,
                         relation: RelationType::DerivedFrom,
                     };
-                    if ctx
-                        .invoke(CapabilityRequest::CreateConstraint {
-                            constraint,
-                            links: vec![link],
-                        })
-                        .is_ok()
-                    {
-                        committed += 1;
-                    }
+                    // Propagate a seam rejection rather than swallowing it (P13: no silent
+                    // failure). A rejected constraint must surface, not vanish from the count.
+                    ctx.invoke(CapabilityRequest::CreateConstraint {
+                        constraint,
+                        links: vec![link],
+                    })
+                    .map_err(|e| MachineError::Internal(e.to_string()))?;
+                    committed += 1;
                 }
 
                 ctx.emit(vec![Event::ConstraintsExtracted { count: committed }])

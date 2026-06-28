@@ -152,10 +152,16 @@ pub struct PhysicalQuantity {
     pub tolerance: Tolerance,
 }
 
-/// Error from a dimensionally-invalid operation (P9 — no silent dimensional errors).
+/// Error from a dimensionally- or numerically-invalid operation (P9 — no silent errors).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UnitError {
-    DimensionMismatch { left: Dimension, right: Dimension },
+    DimensionMismatch {
+        left: Dimension,
+        right: Dimension,
+    },
+    /// A magnitude was not a finite number (e.g. NaN), so the quantities cannot be ordered
+    /// or compared. Surfaced rather than silently treated as equal.
+    NotComparable,
 }
 
 impl std::fmt::Display for UnitError {
@@ -163,6 +169,9 @@ impl std::fmt::Display for UnitError {
         match self {
             UnitError::DimensionMismatch { left, right } => {
                 write!(f, "dimension mismatch: {left:?} vs {right:?}")
+            }
+            UnitError::NotComparable => {
+                write!(f, "physical quantity has a non-finite (NaN) magnitude")
             }
         }
     }
@@ -203,10 +212,10 @@ impl PhysicalQuantity {
                 right: other.dimension(),
             });
         }
-        Ok(self
-            .si_magnitude()
+        // A NaN magnitude has no ordering — surface it rather than silently calling it Equal.
+        self.si_magnitude()
             .partial_cmp(&other.si_magnitude())
-            .unwrap_or(Ordering::Equal))
+            .ok_or(UnitError::NotComparable)
     }
 
     /// True when both quantities denote the same physical value (within a relative epsilon).
@@ -218,6 +227,9 @@ impl PhysicalQuantity {
             });
         }
         let (x, y) = (self.si_magnitude(), other.si_magnitude());
+        if x.is_nan() || y.is_nan() {
+            return Err(UnitError::NotComparable);
+        }
         let scale = x.abs().max(y.abs()).max(1.0);
         Ok((x - y).abs() <= 1e-9 * scale)
     }

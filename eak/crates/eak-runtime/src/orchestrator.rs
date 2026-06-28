@@ -130,7 +130,10 @@ mod tests {
     use super::*;
     use crate::fsm::{MachineError, StepResult};
     use crate::protocol::{Autonomy, CapabilityAck, CapabilityError, CapabilityRequest};
-    use eak_domain::{Constraint, DesignIntent, EntityId, ProvenanceLink, Requirement, Violation};
+    use eak_domain::{
+        Component, Constraint, DesignIntent, EntityId, FunctionalBlock, Net, Pin, ProvenanceLink,
+        Requirement, Violation,
+    };
     use eak_ports::{Event, ReasoningError, ReasoningRequest, ReasoningResponse, Seq, StoreError};
 
     /// A context that only services the engine's phase-lifecycle `emit` calls; the toy
@@ -159,6 +162,18 @@ mod tests {
             vec![]
         }
         fn violations(&self) -> Vec<Violation> {
+            vec![]
+        }
+        fn functional_blocks(&self) -> Vec<FunctionalBlock> {
+            vec![]
+        }
+        fn components(&self) -> Vec<Component> {
+            vec![]
+        }
+        fn pins(&self) -> Vec<Pin> {
+            vec![]
+        }
+        fn nets(&self) -> Vec<Net> {
             vec![]
         }
         fn reason(

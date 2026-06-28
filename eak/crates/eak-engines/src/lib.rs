@@ -5,7 +5,10 @@
 //! are future rules over the same framework. All engines are pure and deterministic.
 //! See `docs/engineering/constraint-engine.md` and `docs/engineering/verification-engine.md`.
 
-use eak_domain::{Constraint, ConstraintKind, EntityId, Requirement, ViolationSeverity};
+use eak_domain::{
+    Component, Constraint, ConstraintKind, EntityId, Net, NetClass, Pin, PinElectricalType,
+    Requirement, ViolationSeverity,
+};
 use eak_units::{PhysicalQuantity, UnitError};
 use std::cmp::Ordering;
 
@@ -92,10 +95,14 @@ fn feasible_interval(c: &Constraint) -> (f64, f64) {
 // ============================= Verification Engine =============================
 
 /// The read-only inputs a [`Rule`] evaluates against — a snapshot of the design's
-/// machine-checkable layer.
+/// machine-checkable layer. Additive in Phase 3: the schematic layer (components, pins,
+/// nets) so ERC rules can reason over connectivity (P9).
 pub struct VerificationContext<'a> {
     pub requirements: &'a [Requirement],
     pub constraints: &'a [Constraint],
+    pub components: &'a [Component],
+    pub pins: &'a [Pin],
+    pub nets: &'a [Net],
 }
 
 /// A problem a rule detected. Not yet a domain `Violation` — the runtime mints that at the
@@ -198,6 +205,121 @@ impl Rule for ConstraintConsistencyRule {
     }
 }
 
+/// Resolve a net's member pin ids against the context's pin slice, preserving member order
+/// so findings stay deterministic. Unknown ids (dangling references) are silently skipped —
+/// member-pin integrity is enforced at the commit seam (P3), not by a rule.
+fn resolve_members<'a>(net: &Net, pins: &'a [Pin]) -> Vec<&'a Pin> {
+    net.members
+        .iter()
+        .filter_map(|id| pins.iter().find(|p| p.id == *id))
+        .collect()
+}
+
+// ================================== ERC Rules ==================================
+
+/// ERC rule: a power net that has at least one consumer ([`PinElectricalType::PowerIn`]) but
+/// no source ([`PinElectricalType::PowerOut`]) is undriven — nothing supplies it (P9). Nets
+/// are scanned in slice order for determinism.
+pub struct ErcPowerNetUndrivenRule;
+
+impl ErcPowerNetUndrivenRule {
+    pub const ID: &'static str = "erc-power-net-undriven";
+
+    pub fn new() -> Self {
+        Self
+    }
+}
+impl Default for ErcPowerNetUndrivenRule {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Rule for ErcPowerNetUndrivenRule {
+    fn id(&self) -> &str {
+        Self::ID
+    }
+
+    fn evaluate(&self, ctx: &VerificationContext) -> Vec<ViolationFinding> {
+        let mut findings = Vec::new();
+        for net in ctx.nets.iter().filter(|n| n.class == NetClass::Power) {
+            let members = resolve_members(net, ctx.pins);
+            let has_consumer = members
+                .iter()
+                .any(|p| p.electrical_type == PinElectricalType::PowerIn);
+            let has_source = members
+                .iter()
+                .any(|p| p.electrical_type == PinElectricalType::PowerOut);
+            if has_consumer && !has_source {
+                findings.push(ViolationFinding {
+                    rule: Self::ID.to_string(),
+                    severity: ViolationSeverity::Error,
+                    subjects: vec![net.id],
+                    message: format!(
+                        "power net \"{}\" ({}) has consumers but no driver (no PowerOut pin)",
+                        net.name,
+                        net.id.short()
+                    ),
+                });
+            }
+        }
+        findings
+    }
+}
+
+/// ERC rule: a net with two or more drivers ([`PinElectricalType::PowerOut`] or
+/// [`PinElectricalType::Output`]) has contending sources (P9). Applies to every net class;
+/// nets are scanned in slice order for determinism.
+pub struct ErcMultipleDriversRule;
+
+impl ErcMultipleDriversRule {
+    pub const ID: &'static str = "erc-multiple-drivers";
+
+    pub fn new() -> Self {
+        Self
+    }
+}
+impl Default for ErcMultipleDriversRule {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Rule for ErcMultipleDriversRule {
+    fn id(&self) -> &str {
+        Self::ID
+    }
+
+    fn evaluate(&self, ctx: &VerificationContext) -> Vec<ViolationFinding> {
+        let mut findings = Vec::new();
+        for net in ctx.nets.iter() {
+            let driver_count = resolve_members(net, ctx.pins)
+                .iter()
+                .filter(|p| {
+                    matches!(
+                        p.electrical_type,
+                        PinElectricalType::PowerOut | PinElectricalType::Output
+                    )
+                })
+                .count();
+            if driver_count >= 2 {
+                findings.push(ViolationFinding {
+                    rule: Self::ID.to_string(),
+                    severity: ViolationSeverity::Error,
+                    subjects: vec![net.id],
+                    message: format!(
+                        "net \"{}\" ({}) has {} drivers; only one is allowed",
+                        net.name,
+                        net.id.short(),
+                        driver_count
+                    ),
+                });
+            }
+        }
+        findings
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,6 +400,9 @@ mod tests {
         let ctx = VerificationContext {
             requirements: &[],
             constraints: &cons,
+            components: &[],
+            pins: &[],
+            nets: &[],
         };
         let findings = rule.evaluate(&ctx);
         assert_eq!(findings.len(), 1);
@@ -298,6 +423,9 @@ mod tests {
         let findings = engine.run(&VerificationContext {
             requirements: &[],
             constraints: &cons,
+            components: &[],
+            pins: &[],
+            nets: &[],
         });
         assert_eq!(findings.len(), 1);
     }
@@ -311,7 +439,95 @@ mod tests {
         let findings = rule.evaluate(&VerificationContext {
             requirements: &[],
             constraints: &cons,
+            components: &[],
+            pins: &[],
+            nets: &[],
         });
         assert!(findings.is_empty());
+    }
+
+    // -------------------------------- ERC rule tests --------------------------------
+
+    fn pin(id: u128, ty: PinElectricalType) -> Pin {
+        Pin {
+            id: EntityId(id),
+            component: EntityId(900 + id),
+            designation: format!("P{id}"),
+            electrical_type: ty,
+        }
+    }
+
+    fn net(id: u128, class: NetClass, members: Vec<u128>) -> Net {
+        Net {
+            id: EntityId(id),
+            name: format!("NET{id}"),
+            class,
+            members: members.into_iter().map(EntityId).collect(),
+        }
+    }
+
+    fn erc_ctx<'a>(pins: &'a [Pin], nets: &'a [Net]) -> VerificationContext<'a> {
+        VerificationContext {
+            requirements: &[],
+            constraints: &[],
+            components: &[],
+            pins,
+            nets,
+        }
+    }
+
+    #[test]
+    fn undriven_power_net_is_flagged() {
+        // A power net with two consumers and no source is undriven.
+        let pins = vec![
+            pin(1, PinElectricalType::PowerIn),
+            pin(2, PinElectricalType::PowerIn),
+        ];
+        let nets = vec![net(10, NetClass::Power, vec![1, 2])];
+        let findings = ErcPowerNetUndrivenRule::new().evaluate(&erc_ctx(&pins, &nets));
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule, ErcPowerNetUndrivenRule::ID);
+        assert_eq!(findings[0].severity, ViolationSeverity::Error);
+        assert_eq!(findings[0].subjects, vec![EntityId(10)]);
+    }
+
+    #[test]
+    fn driven_power_net_passes_both_erc_rules() {
+        // One PowerOut driver and N PowerIn consumers: not undriven, not contended.
+        let pins = vec![
+            pin(1, PinElectricalType::PowerOut),
+            pin(2, PinElectricalType::PowerIn),
+            pin(3, PinElectricalType::PowerIn),
+        ];
+        let nets = vec![net(10, NetClass::Power, vec![1, 2, 3])];
+        let ctx = erc_ctx(&pins, &nets);
+        assert!(ErcPowerNetUndrivenRule::new().evaluate(&ctx).is_empty());
+        assert!(ErcMultipleDriversRule::new().evaluate(&ctx).is_empty());
+    }
+
+    #[test]
+    fn two_drivers_are_flagged() {
+        // Two sources (PowerOut + Output) on one net contend.
+        let pins = vec![
+            pin(1, PinElectricalType::PowerOut),
+            pin(2, PinElectricalType::Output),
+            pin(3, PinElectricalType::PowerIn),
+        ];
+        let nets = vec![net(10, NetClass::Signal, vec![1, 2, 3])];
+        let findings = ErcMultipleDriversRule::new().evaluate(&erc_ctx(&pins, &nets));
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule, ErcMultipleDriversRule::ID);
+        assert_eq!(findings[0].severity, ViolationSeverity::Error);
+        assert_eq!(findings[0].subjects, vec![EntityId(10)]);
+    }
+
+    #[test]
+    fn power_net_without_consumers_is_not_flagged_undriven() {
+        // No PowerIn member: nothing demands a driver, so the undriven rule stays silent.
+        let pins = vec![pin(1, PinElectricalType::PowerOut)];
+        let nets = vec![net(10, NetClass::Power, vec![1])];
+        assert!(ErcPowerNetUndrivenRule::new()
+            .evaluate(&erc_ctx(&pins, &nets))
+            .is_empty());
     }
 }

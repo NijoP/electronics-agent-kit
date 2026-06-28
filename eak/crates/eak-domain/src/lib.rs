@@ -248,24 +248,150 @@ pub struct Waiver {
     pub decided_by: String,
 }
 
+// ===================== Phase 3: schematic entities =====================
+//
+// Phase 3 adds the realization layer beneath the Phase-2 verification layer: a
+// [`FunctionalBlock`] groups the requirements it realizes; a [`Component`] is a concrete
+// part minted from a block; a [`Pin`] is an addressed terminal of a component; a [`Net`]
+// is a first-class electrical connection between pins. Each entity carries the upstream
+// trace it derives from (P3), so the schematic stays explainable back to intent. See
+// `docs/engineering/schematic-model.md`.
+
+/// A unit of design intent realized as part of the architecture: it names a function and
+/// the requirements (P3) it is responsible for satisfying. Components are minted from a block.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FunctionalBlock {
+    pub id: EntityId,
+    pub name: String,
+    pub function: String,
+    /// The requirements this block is responsible for realizing.
+    pub requirements: Vec<EntityId>,
+}
+
+impl FunctionalBlock {
+    /// Domain invariant: a block carries a non-empty name. Requirement-link integrity
+    /// (each id exists) is re-checked at the capability seam (P3).
+    pub fn validate(&self) -> Result<(), DomainError> {
+        if self.name.trim().is_empty() {
+            return Err(DomainError::EmptyField("functional block name"));
+        }
+        Ok(())
+    }
+}
+
+/// The coarse kind of a [`Component`]. Drives ERC expectations (e.g. a regulator is a
+/// power source, a connector may be a sink).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ComponentClass {
+    Connector,
+    Regulator,
+    Ic,
+    Resistor,
+    Capacitor,
+}
+
+/// The electrical role of a [`Pin`]. Drives ERC drive/sink analysis (P9): a power net must
+/// have a driver ([`PowerOut`](PinElectricalType::PowerOut)); two outputs on one net contend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum PinElectricalType {
+    PowerIn,
+    PowerOut,
+    Input,
+    Output,
+    Bidirectional,
+    Passive,
+    Ground,
+    NoConnect,
+}
+
+/// The electrical class of a [`Net`]. Drives ERC: power and ground nets demand a driver,
+/// signal nets are checked for contention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum NetClass {
+    Power,
+    Ground,
+    Signal,
+}
+
+/// A concrete part realizing some of a [`FunctionalBlock`]'s function. Minted from a block,
+/// so it is always traceable back to the intent it serves (P3). The optional `value` is a
+/// typed physical quantity (e.g. a resistor's 10 kΩ), hence `Component` is not `Eq`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Component {
+    pub id: EntityId,
+    pub refdes: String,
+    pub class: ComponentClass,
+    pub value: Option<PhysicalQuantity>,
+    /// The functional block this component was realized from.
+    pub from_block: EntityId,
+}
+
+impl Component {
+    /// Domain invariant: a component carries a non-empty reference designator. The
+    /// block-link existence check lives at the capability seam (P3).
+    pub fn validate(&self) -> Result<(), DomainError> {
+        if self.refdes.trim().is_empty() {
+            return Err(DomainError::EmptyField("component reference designator"));
+        }
+        Ok(())
+    }
+}
+
+/// An addressed terminal of a [`Component`]. Referenced by id from [`Net::members`], never
+/// by position, so connectivity survives renumbering (domain-model identity rule).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Pin {
+    pub id: EntityId,
+    pub component: EntityId,
+    pub designation: String,
+    pub electrical_type: PinElectricalType,
+}
+
+/// A first-class electrical connection joining a set of [`Pin`]s. Made addressable so ERC
+/// findings can name the offending net and trace it (P3, P13).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Net {
+    pub id: EntityId,
+    pub name: String,
+    pub class: NetClass,
+    /// The pin ids joined by this net.
+    pub members: Vec<EntityId>,
+}
+
+impl Net {
+    /// Domain invariant: a net carries a non-empty name. Member-pin integrity (each id
+    /// exists) is re-checked at the capability seam (P3).
+    pub fn validate(&self) -> Result<(), DomainError> {
+        if self.name.trim().is_empty() {
+            return Err(DomainError::EmptyField("net name"));
+        }
+        Ok(())
+    }
+}
+
 /// A violated domain invariant.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DomainError {
     EmptyStatement,
+    /// A named, required text field was blank (carries the field's human label, so the
+    /// rejection message is accurate for whichever entity raised it).
+    EmptyField(&'static str),
     AcceptedRequirementNeedsCriterion,
     AcceptedRequirementNeedsSource,
 }
 
 impl std::fmt::Display for DomainError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let msg = match self {
-            DomainError::EmptyStatement => "requirement statement is empty",
+        match self {
+            DomainError::EmptyStatement => write!(f, "requirement statement is empty"),
+            DomainError::EmptyField(field) => write!(f, "{field} must not be empty"),
             DomainError::AcceptedRequirementNeedsCriterion => {
-                "accepted requirement lacks an acceptance criterion"
+                write!(f, "accepted requirement lacks an acceptance criterion")
             }
-            DomainError::AcceptedRequirementNeedsSource => "accepted requirement lacks a source",
-        };
-        write!(f, "{msg}")
+            DomainError::AcceptedRequirementNeedsSource => {
+                write!(f, "accepted requirement lacks a source")
+            }
+        }
     }
 }
 impl std::error::Error for DomainError {}
@@ -400,5 +526,79 @@ mod tests {
         v.status = ViolationStatus::Open;
         v.severity = ViolationSeverity::Warning;
         assert!(!v.is_blocking());
+    }
+
+    #[test]
+    fn functional_block_rejects_blank_name() {
+        let b = FunctionalBlock {
+            id: EntityId(1),
+            name: "   ".into(),
+            function: "5 V rail".into(),
+            requirements: vec![EntityId(2)],
+        };
+        assert_eq!(
+            b.validate(),
+            Err(DomainError::EmptyField("functional block name"))
+        );
+    }
+
+    #[test]
+    fn well_formed_functional_block_validates() {
+        let b = FunctionalBlock {
+            id: EntityId(1),
+            name: "Power Supply".into(),
+            function: "step 12 V down to 5 V".into(),
+            requirements: vec![EntityId(2)],
+        };
+        assert!(b.validate().is_ok());
+    }
+
+    #[test]
+    fn component_rejects_blank_refdes() {
+        let c = Component {
+            id: EntityId(1),
+            refdes: "  ".into(),
+            class: ComponentClass::Regulator,
+            value: None,
+            from_block: EntityId(2),
+        };
+        assert_eq!(
+            c.validate(),
+            Err(DomainError::EmptyField("component reference designator"))
+        );
+    }
+
+    #[test]
+    fn well_formed_component_validates() {
+        let c = Component {
+            id: EntityId(1),
+            refdes: "U1".into(),
+            class: ComponentClass::Resistor,
+            value: Some(PhysicalQuantity::new(10_000.0, eak_units::Unit::Ohm)),
+            from_block: EntityId(2),
+        };
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn net_rejects_blank_name() {
+        let n = Net {
+            id: EntityId(1),
+            name: "".into(),
+            class: NetClass::Power,
+            members: vec![EntityId(2), EntityId(3)],
+        };
+        assert_eq!(n.validate(), Err(DomainError::EmptyField("net name")));
+    }
+
+    #[test]
+    fn well_formed_net_validates() {
+        let n = Net {
+            id: EntityId(1),
+            name: "+5V".into(),
+            class: NetClass::Power,
+            members: vec![EntityId(2), EntityId(3)],
+        };
+        assert!(n.validate().is_ok());
     }
 }
