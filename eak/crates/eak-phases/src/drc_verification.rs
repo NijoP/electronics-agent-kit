@@ -3,7 +3,7 @@
 //! Structurally a sibling of [`ErcVerificationMachine`](crate::ErcVerificationMachine), but its
 //! [`VerificationEngine`] is loaded with the DRC rules ([`DrcOutOfBoundsRule`],
 //! [`DrcCourtyardOverlapRule`], [`DrcTraceWidthRule`], [`DrcUnroutedNetRule`],
-//! [`DrcNetOpenRule`]) and it runs them
+//! [`DrcNetOpenRule`], [`DrcCopperClearanceRule`]) and it runs them
 //! over the physical layer (the board outline, its placements, the committed nets, and the routed
 //! tracks). Each *new* finding becomes a
 //! first-class [`Violation`] linked back to the placement(s) or track(s) it implicates so it is
@@ -17,8 +17,8 @@
 
 use eak_domain::{ProvenanceLink, RelationType, Violation, ViolationStatus};
 use eak_engines::{
-    DrcCourtyardOverlapRule, DrcNetOpenRule, DrcOutOfBoundsRule, DrcTraceWidthRule,
-    DrcUnroutedNetRule, VerificationContext, VerificationEngine,
+    DrcCopperClearanceRule, DrcCourtyardOverlapRule, DrcNetOpenRule, DrcOutOfBoundsRule,
+    DrcTraceWidthRule, DrcUnroutedNetRule, VerificationContext, VerificationEngine,
 };
 use eak_ports::Event;
 use eak_runtime::{AgentContext, CapabilityRequest, Machine, MachineError, StepResult};
@@ -30,10 +30,11 @@ impl DrcVerificationMachine {
         Self
     }
 
-    /// The verification engine for this phase: the five Phase-3 DRC rules — two placement geometry
-    /// checks, the routing trace-width check, the net-realization completeness check, and the
-    /// net-connectivity (open-detection) check — registered against the same generic framework
-    /// that Constraint, ERC, and BOM Verification use (reuse: one framework, many checks).
+    /// The verification engine for this phase: the six Phase-3 DRC rules — two placement geometry
+    /// checks, the routing trace-width check, the net-realization completeness check, the
+    /// net-connectivity (open-detection) check, and the copper-to-copper clearance (short-margin)
+    /// check — registered against the same generic framework that Constraint, ERC, and BOM
+    /// Verification use (reuse: one framework, many checks).
     fn engine() -> VerificationEngine {
         VerificationEngine::new()
             .with_rule(Box::new(DrcOutOfBoundsRule::new()))
@@ -41,6 +42,7 @@ impl DrcVerificationMachine {
             .with_rule(Box::new(DrcTraceWidthRule::new()))
             .with_rule(Box::new(DrcUnroutedNetRule::new()))
             .with_rule(Box::new(DrcNetOpenRule::new()))
+            .with_rule(Box::new(DrcCopperClearanceRule::new()))
     }
 }
 impl Default for DrcVerificationMachine {

@@ -640,9 +640,11 @@ impl Rule for DrcCourtyardOverlapRule {
 /// requirements, in commit order. Several fab-process floors share this one target space through a
 /// documented POSITIONAL SLOT CONTRACT (no typed discriminator yet): slot 0 = the minimum trace
 /// width ([`DrcTraceWidthRule`]), slot 1 = the board-edge keep-out band
-/// ([`resolve_edge_keepout_si`], used by the DFM rules). A caller takes its slot by position and
-/// falls back to a constant when its slot is unstated, so a lone trace-width target never weakens
-/// the keep-out and vice-versa. A future increment may replace the slots with a typed target role.
+/// ([`resolve_edge_keepout_si`], used by the DFM rules), slot 2 = the minimum copper-to-copper
+/// spacing ([`DrcCopperClearanceRule`]). A caller takes its slot by position; an unstated slot
+/// either stays silent (slots 0 and 2 emit nothing rather than guess a floor) or falls back to a
+/// constant (slot 1's keep-out), so a lone trace-width target never weakens another floor and
+/// vice-versa. A future increment may replace the slots with a typed target role.
 fn fabrication_length_targets(reqs: &[Requirement]) -> impl Iterator<Item = &PhysicalQuantity> {
     reqs.iter()
         .filter(|r| r.category == RequirementCategory::Fabrication)
@@ -941,6 +943,157 @@ impl Rule for DrcNetOpenRule {
                         components
                     ),
                 });
+            }
+        }
+        findings
+    }
+}
+
+/// Twice the signed area of triangle `(a, b, c)` — positive when `a -> b -> c` turns
+/// counter-clockwise, zero when the three points are colinear. The orientation primitive behind
+/// the proper-crossing test in [`segment_distance`].
+fn orient(a: (f64, f64), b: (f64, f64), c: (f64, f64)) -> f64 {
+    (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0)
+}
+
+/// The Euclidean distance from point `p` to the finite segment `s` in the SI plane (metres). `p`
+/// is projected onto the segment with the projection parameter clamped to `[0, 1]`, so when the
+/// foot of the perpendicular falls beyond an end the nearest point is that endpoint; a degenerate
+/// (zero-length) segment reduces to the point-to-point distance.
+fn point_segment_distance(p: (f64, f64), s: ((f64, f64), (f64, f64))) -> f64 {
+    let (a, b) = s;
+    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+    let len_sq = dx * dx + dy * dy;
+    let t = if len_sq <= 0.0 {
+        0.0
+    } else {
+        (((p.0 - a.0) * dx + (p.1 - a.1) * dy) / len_sq).clamp(0.0, 1.0)
+    };
+    let (cx, cy) = (a.0 + t * dx, a.1 + t * dy);
+    ((p.0 - cx).powi(2) + (p.1 - cy).powi(2)).sqrt()
+}
+
+/// The minimum Euclidean distance between two finite segments `a` and `b` in the SI plane
+/// (metres), used by [`DrcCopperClearanceRule`] to gauge the gap between two trace centre-lines.
+/// Zero when the segments cross or touch: a *proper* (transversal) crossing is caught by the
+/// orientation test, while a touch/overlap (including colinear overlap, e.g. the stub router's
+/// identical different-net segments) surfaces as a zero endpoint-to-segment distance. Otherwise
+/// the closest pair includes an endpoint, so the result is the least of the four
+/// endpoint-to-segment distances. Pure and deterministic — closed form, no iteration.
+fn segment_distance(a: ((f64, f64), (f64, f64)), b: ((f64, f64), (f64, f64))) -> f64 {
+    let (a1, a2) = a;
+    let (b1, b2) = b;
+    // Proper crossing: a1/a2 strictly straddle line b AND b1/b2 strictly straddle line a.
+    let (d1, d2) = (orient(b1, b2, a1), orient(b1, b2, a2));
+    let (d3, d4) = (orient(a1, a2, b1), orient(a1, a2, b2));
+    let straddles_b = (d1 > 0.0) != (d2 > 0.0) && d1 != 0.0 && d2 != 0.0;
+    let straddles_a = (d3 > 0.0) != (d4 > 0.0) && d3 != 0.0 && d4 != 0.0;
+    if straddles_a && straddles_b {
+        return 0.0;
+    }
+    point_segment_distance(a1, b)
+        .min(point_segment_distance(a2, b))
+        .min(point_segment_distance(b1, a))
+        .min(point_segment_distance(b2, a))
+}
+
+/// DRC rule: two copper traces on the SAME side belonging to DIFFERENT nets must keep at least the
+/// design's minimum copper-to-copper spacing — the fabrication clearance floor. Two conductors
+/// closer than the process can reliably etch and isolate risk an acid-trap or a solder bridge — a
+/// hard short between distinct nets — so it is a blocking Error. It is the co-equal sibling of
+/// [`DrcTraceWidthRule`] (a per-track floor) and the geometric counterpart to [`DrcNetOpenRule`]'s
+/// topological open check: that rule asks whether a net's copper joins its own pads; this asks
+/// whether one net's copper strays too near another's.
+///
+/// SPACING SOURCE: slot 2 of the [`fabrication_length_targets`] positional contract. With NO such
+/// target stated there is no clearance floor to check against, so the rule emits nothing rather
+/// than guessing one — mirroring [`DrcTraceWidthRule`]'s "no floor -> silent". Crucially there is
+/// NO constant fallback: the stub router mints identical, overlapping centre-lines for the
+/// different nets that connect the same component pair (every member centroid shares `y = MARGIN`),
+/// a true geometric coincidence that any non-zero floor would (correctly) flag — so a fallback
+/// would fail the released golden board. A design opts into the check by pinning the floor.
+///
+/// GEOMETRY: pairs scanned `i < j` over the tracks (slice order, deterministic). A pair is skipped
+/// when the tracks sit on opposite [`BoardSide`] layers (opposite copper never shorts — as in
+/// [`DrcCourtyardOverlapRule`]) or share a net (a net's own daisy segments and branches may touch
+/// — the same-net exemption). Otherwise the edge-to-edge gap is the centre-line
+/// [`segment_distance`] less each trace's half-width; the pair is flagged when it falls below the
+/// floor by more than an epsilon (the same tolerance shape [`DrcTraceWidthRule`] and the EMC rule
+/// use, so copper exactly at the floor is never a false positive). All comparisons are on the SI
+/// axis via `si_magnitude()` (P9). A flagged pair implicates both tracks, listed as a sorted
+/// subject vector so the dedup key is stable regardless of pair order
+/// (`Violation -> Track -> Net -> ... -> Requirement -> Intent`).
+///
+/// SCOPE: IPC-2221 scales the minimum spacing with the peak voltage between the two conductors,
+/// but the model carries no per-net voltage, so the rule applies the stated slot-2 floor flat.
+/// Voltage-derived scaling is a noted future refinement once a net carries a voltage (the same
+/// deferred-reasoning boundary as the EMC velocity factor), not a fabricated figure.
+pub struct DrcCopperClearanceRule;
+
+impl DrcCopperClearanceRule {
+    pub const ID: &'static str = "drc-copper-clearance";
+
+    pub fn new() -> Self {
+        Self
+    }
+}
+impl Default for DrcCopperClearanceRule {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Rule for DrcCopperClearanceRule {
+    fn id(&self) -> &str {
+        Self::ID
+    }
+
+    fn evaluate(&self, ctx: &VerificationContext) -> Vec<ViolationFinding> {
+        // The clearance floor: slot 2 of the Fabrication Length targets. Absent one, there is no
+        // floor to check against — and deliberately NO constant fallback (see the type doc-comment).
+        let Some(min_space) = fabrication_length_targets(ctx.requirements).nth(2) else {
+            return Vec::new();
+        };
+        let min_space_si = min_space.si_magnitude();
+        let mut findings = Vec::new();
+        let tracks = ctx.tracks;
+        for i in 0..tracks.len() {
+            for j in (i + 1)..tracks.len() {
+                let (a, b) = (&tracks[i], &tracks[j]);
+                // Opposite copper sides never short; a net's own copper may touch (same-net exempt).
+                if a.layer != b.layer || a.net == b.net {
+                    continue;
+                }
+                let seg_a = (
+                    (a.x1.si_magnitude(), a.y1.si_magnitude()),
+                    (a.x2.si_magnitude(), a.y2.si_magnitude()),
+                );
+                let seg_b = (
+                    (b.x1.si_magnitude(), b.y1.si_magnitude()),
+                    (b.x2.si_magnitude(), b.y2.si_magnitude()),
+                );
+                // Edge-to-edge gap: centre-line distance less each trace's half-width.
+                let gap = segment_distance(seg_a, seg_b)
+                    - (a.width.si_magnitude() + b.width.si_magnitude()) / 2.0;
+                // Below the floor by more than an epsilon, so copper exactly at the floor is never
+                // a false violation. `scale` clamps to 1 m; spacings are sub-millimetre, so in
+                // practice this is an absolute ~1 nm tolerance.
+                let scale = min_space_si.abs().max(gap.abs()).max(1.0);
+                if min_space_si - gap > 1e-9 * scale {
+                    let mut subjects = vec![a.id, b.id];
+                    subjects.sort(); // stable dedup key regardless of pair order
+                    findings.push(ViolationFinding {
+                        rule: Self::ID.to_string(),
+                        severity: ViolationSeverity::Error,
+                        subjects,
+                        message: format!(
+                            "tracks {} and {} are closer than the {} copper-to-copper clearance",
+                            a.id.short(),
+                            b.id.short(),
+                            min_space
+                        ),
+                    });
+                }
             }
         }
         findings
@@ -1924,6 +2077,103 @@ mod tests {
         let tracks = vec![seg(100, 50, 5.0, 5.0, 5.0, 5.0)];
         assert!(DrcNetOpenRule::new()
             .evaluate(&open_ctx(&pins, &nets, &placements, &tracks))
+            .is_empty());
+    }
+
+    // --------------------------- copper-clearance rule tests ---------------------------
+    // (Reuses the `fab_req(id, &[mm…])` Fabrication-target builder defined in the DFM tests; the
+    // clearance floor is slot 2 of that positional target contract.)
+
+    #[test]
+    fn overlapping_different_net_copper_is_silent_without_a_clearance_floor() {
+        // The happy-path guard: the stub router mints identical, overlapping centre-lines for two
+        // different nets (gap = 0). With slots 0/1 stated but NO slot-2 clearance floor — exactly
+        // the default run — the rule emits nothing rather than flag this true geometric overlap.
+        let reqs = vec![fab_req(710, &[0.75, 0.5])];
+        let tracks = vec![
+            seg(100, 60, 5.0, 5.0, 25.0, 5.0),
+            seg(101, 61, 5.0, 5.0, 25.0, 5.0),
+        ];
+        assert!(DrcCopperClearanceRule::new()
+            .evaluate(&trace_ctx(&reqs, &tracks))
+            .is_empty());
+    }
+
+    #[test]
+    fn overlapping_different_net_copper_is_flagged_once_a_floor_is_stated() {
+        // The same overlapping pair, now with a slot-2 floor stated: the zero gap is far below
+        // 1.0 mm, so it is a blocking short. Proves the silence above is the absent floor, not a
+        // geometry quirk — and that colinear overlap reads as a zero centre-line distance.
+        let reqs = vec![fab_req(710, &[0.75, 0.5, 1.0])];
+        let tracks = vec![
+            seg(100, 60, 5.0, 5.0, 25.0, 5.0),
+            seg(101, 61, 5.0, 5.0, 25.0, 5.0),
+        ];
+        let findings = DrcCopperClearanceRule::new().evaluate(&trace_ctx(&reqs, &tracks));
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule, DrcCopperClearanceRule::ID);
+        assert_eq!(findings[0].severity, ViolationSeverity::Error);
+        assert_eq!(findings[0].subjects, vec![EntityId(100), EntityId(101)]);
+    }
+
+    #[test]
+    fn parallel_different_net_tracks_closer_than_the_floor_are_flagged() {
+        // Two parallel traces 0.5 mm apart centre-to-centre; each is 0.25 mm wide, so the
+        // edge-to-edge gap is 0.25 mm — below the 1.0 mm slot-2 floor. Listed b-before-a in slice
+        // order to prove the subject vector is sorted.
+        let reqs = vec![fab_req(710, &[0.75, 0.5, 1.0])];
+        let tracks = vec![
+            seg(101, 61, 0.0, 0.5, 10.0, 0.5),
+            seg(100, 60, 0.0, 0.0, 10.0, 0.0),
+        ];
+        let findings = DrcCopperClearanceRule::new().evaluate(&trace_ctx(&reqs, &tracks));
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule, DrcCopperClearanceRule::ID);
+        assert_eq!(findings[0].subjects, vec![EntityId(100), EntityId(101)]);
+    }
+
+    #[test]
+    fn same_net_tracks_are_exempt_from_the_clearance_floor() {
+        // The identical close geometry, but both traces realize ONE net: a net's own copper may
+        // touch, so the same-net exemption keeps it silent.
+        let reqs = vec![fab_req(710, &[0.75, 0.5, 1.0])];
+        let tracks = vec![
+            seg(100, 60, 0.0, 0.0, 10.0, 0.0),
+            seg(101, 60, 0.0, 0.5, 10.0, 0.5),
+        ];
+        assert!(DrcCopperClearanceRule::new()
+            .evaluate(&trace_ctx(&reqs, &tracks))
+            .is_empty());
+    }
+
+    #[test]
+    fn copper_on_opposite_sides_does_not_short() {
+        // The close different-net pair, but one trace on Top and one on Bottom: opposite copper
+        // never shorts, so the pair is skipped.
+        let reqs = vec![fab_req(710, &[0.75, 0.5, 1.0])];
+        let tracks = vec![
+            seg(100, 60, 0.0, 0.0, 10.0, 0.0),
+            Track {
+                layer: BoardSide::Bottom,
+                ..seg(101, 61, 0.0, 0.5, 10.0, 0.5)
+            },
+        ];
+        assert!(DrcCopperClearanceRule::new()
+            .evaluate(&trace_ctx(&reqs, &tracks))
+            .is_empty());
+    }
+
+    #[test]
+    fn copper_clearing_the_floor_is_not_flagged() {
+        // Two different-net traces 5 mm apart centre-to-centre: the 4.75 mm edge-to-edge gap
+        // comfortably clears the 1.0 mm floor, so there is no finding.
+        let reqs = vec![fab_req(710, &[0.75, 0.5, 1.0])];
+        let tracks = vec![
+            seg(100, 60, 0.0, 0.0, 10.0, 0.0),
+            seg(101, 61, 0.0, 5.0, 10.0, 5.0),
+        ];
+        assert!(DrcCopperClearanceRule::new()
+            .evaluate(&trace_ctx(&reqs, &tracks))
             .is_empty());
     }
 
