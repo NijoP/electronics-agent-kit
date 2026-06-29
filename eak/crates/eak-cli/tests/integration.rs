@@ -1,9 +1,10 @@
-//! End-to-end verification of the Phase-3 exit criteria over the full 14-phase workflow:
+//! End-to-end verification of the Phase-3 exit criteria over the full 15-phase workflow:
 //! Requirement Planning -> Engineering Analysis -> Constraint Extraction -> Constraint
 //! Verification -> Schematic Planning -> ERC Verification -> BOM Planning -> BOM Verification
 //! -> PCB Floor Planning -> Component Placement -> Routing Planning -> DRC Verification -> DFM
-//! Verification -> EMC Analysis. A consistent, realizable design runs all fourteen phases clean
-//! and lands a placed, routed, manufacturable, electromagnetically-clean board. Seven kinds of
+//! Verification -> EMC Analysis -> Manufacturing Generation. A consistent, realizable design runs
+//! all fifteen phases clean and is RELEASED — lowered to a Manufacturing IR once the global gate
+//! finds no open blocking violation. Seven kinds of
 //! fault are each caught at their gate, routed back automatically, and left fully traceable to
 //! their cause: an infeasible constraint pair (Constraint Verification), an electrically-invalid
 //! power net with consumers but no driver (ERC), a procurement fault — an end-of-life catalog
@@ -334,22 +335,22 @@ fn high_speed_engine() -> Box<dyn ReasoningEngine> {
 }
 
 #[test]
-fn run_replays_byte_identical_and_runs_fourteen_phases() {
+fn run_replays_byte_identical_and_runs_fifteen_phases() {
     let (config, log) = cfg("det", 1);
     let report = run(&config).expect("run succeeds");
 
     // Full Phase-3 workflow on a consistent, realizable design: RP -> Engineering Analysis ->
     // Constraint Extraction -> Constraint Verification -> Schematic Planning -> ERC -> BOM
     // Planning -> BOM Verification -> PCB Floor Planning -> Component Placement -> Routing
-    // Planning -> DRC -> DFM -> EMC, all OK.
-    assert_eq!(report.outcomes.len(), 14);
+    // Planning -> DRC -> DFM -> EMC -> Manufacturing Generation, all OK.
+    assert_eq!(report.outcomes.len(), 15);
     assert!(report
         .outcomes
         .iter()
         .all(|(_, o)| matches!(o, PhaseOutcome::Success)));
-    // The last phase is the EMC gate, and it passed (the default intent states no operating
-    // frequency, so the antenna-length analysis is silent).
-    assert_eq!(report.outcomes.last().unwrap().0, "EmcAnalysis");
+    // The terminal phase is Manufacturing Generation, and it RELEASED: the global gate found no
+    // open blocking violation, so the design lowered to a Manufacturing IR.
+    assert_eq!(report.outcomes.last().unwrap().0, "ManufacturingGeneration");
 
     // Three requirements; two carry targets, so two constraints; no violations.
     assert_eq!(report.state.requirements.len(), 3);
@@ -1224,7 +1225,7 @@ fn two_runs_with_same_seed_are_identical() {
     let (c2, l2) = cfg("rep2", 7);
     let r1 = run(&c1).expect("run 1");
     let r2 = run(&c2).expect("run 2");
-    // determinism of the run itself (seeded ids + logical clock) across the 14-phase workflow.
+    // determinism of the run itself (seeded ids + logical clock) across the 15-phase workflow.
     assert_eq!(r1.state, r2.state);
     let _ = std::fs::remove_file(&l1);
     let _ = std::fs::remove_file(&l2);

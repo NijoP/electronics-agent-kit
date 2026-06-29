@@ -87,6 +87,15 @@ stateDiagram-v2
 - **Incomplete output** caught in `ValidatingOutputs` → regenerate; an inconsistent manufacturing set is never published.
 - **Generation failure** (e.g. an un-exportable geometry) → `Failed`; surfaced to the engineer; the design state is untouched because nothing was committed.
 
+## Phase-3 implementation note (increment 8)
+
+The shipped `ManufacturingGenerationMachine` (in `eak-phases`) is the deterministic realization of this spec and the **terminal** phase of the 15-phase CLI workflow. Its states collapse to: `Idle → CheckingGate → (Failed = Blocked | Generating → Done = Released)`.
+
+- **The global gate** (`CheckingGate`): it fails (`Blocked`) iff **any** open, error-severity [Violation](../foundation/engineering-domain-model.md#violation) remains anywhere in the design — `ctx.violations().filter(is_blocking).count() > 0`. This is the cross-phase all-clear the per-phase gating (increment 5) deliberately reserved for here: a per-phase gate scopes to its own rules, but the manufacturing gate spans ERC/DRC/BOM/DFM/EMC. A *waived* violation is not blocking, so an accepted defect does not block release; an unwaived error does. The machine has **no loop-back** — it is reached only once every upstream per-phase gate has passed, so in a normal run the global gate is already clear.
+- **Generation**: it lowers the routed [PCB IR](../compiler/ir/pcb-ir.md) and the [BOM IR](../compiler/ir/bom-ir.md) into the terminal [Manufacturing IR](../compiler/ir/manufacturing-ir.md) (`eak-compiler`), which **joins** the two seams — the fabrication outline + copper, the assembly pick-and-place (placement geometry + a `PartAssignment` refdes→MPN binding), and the procurement BOM. Its completeness invariant: every placed component must resolve to a bom line and a real part (`IrError::UnsourcedPlacement`), so no assembly directive ships without an MPN. The release milestone is recorded as the audit `Event::ManufacturingGenerated`; the IR itself is a projection (re-derivable), so a release replays bit-identically (P4).
+
+The HITL `AwaitingRelease`/`ValidatingOutputs` states and the external Artifact Store are the documented target; the deterministic build auto-releases at `Autonomous` autonomy and treats the projected IR as the artifact.
+
 ## Related documents
 
 [`agents/manufacturing-agent.md`](../agents/manufacturing-agent.md) · [`compiler/ir/manufacturing-ir.md`](../compiler/ir/manufacturing-ir.md) · [`compiler/transformations.md`](../compiler/transformations.md) · [`engineering/verification-engine.md`](../engineering/verification-engine.md) · [`core/workflow-orchestration.md`](../core/workflow-orchestration.md) · [`state-machines/emc-analysis.md`](emc-analysis.md) · [`state-machines/README.md`](README.md)

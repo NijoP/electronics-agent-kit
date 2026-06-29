@@ -12,6 +12,7 @@ pub mod drc_verification;
 pub mod emc_analysis;
 pub mod engineering_analysis;
 pub mod erc_verification;
+pub mod manufacturing_generation;
 pub mod pcb_floor_planning;
 pub mod requirement_planning;
 pub mod routing_planning;
@@ -28,6 +29,7 @@ pub use drc_verification::DrcVerificationMachine;
 pub use emc_analysis::EmcAnalysisMachine;
 pub use engineering_analysis::EngineeringAnalysisMachine;
 pub use erc_verification::ErcVerificationMachine;
+pub use manufacturing_generation::ManufacturingGenerationMachine;
 pub use pcb_floor_planning::PcbFloorPlanningMachine;
 pub use requirement_planning::RequirementPlanningMachine;
 pub use routing_planning::RoutingPlanningMachine;
@@ -646,7 +648,7 @@ mod tests {
         core.capture_intent("USB-C powered sensor node, < 5 W", "engineer")
             .unwrap();
 
-        // The full 14-phase chain, run linearly (each phase succeeds, so no loop-back fires).
+        // The full 15-phase chain, run linearly (each phase succeeds, so no loop-back fires).
         let mut plan = WorkflowPlan::new(vec![
             Box::new(RequirementPlanningMachine::new()),
             Box::new(EngineeringAnalysisMachine::new()),
@@ -662,11 +664,15 @@ mod tests {
             Box::new(DrcVerificationMachine::new()),
             Box::new(DfmVerificationMachine::new()),
             Box::new(EmcAnalysisMachine::new()),
+            Box::new(ManufacturingGenerationMachine::new()),
         ]);
         let results = Orchestrator::new().run(&mut plan, &mut core);
 
-        assert_eq!(results.len(), 14);
+        assert_eq!(results.len(), 15);
         assert!(results.iter().all(|(_, o)| *o == PhaseOutcome::Success));
+        // The terminal phase released: the global gate found no open blocking violation, so the
+        // design lowered to a Manufacturing IR.
+        assert_eq!(results.last().unwrap().0, "ManufacturingGeneration");
         // The PCB layer exists: an outline plus one placement per realized component, all
         // within bounds, non-overlapping, and clear of the board-edge keep-out, so both the
         // placement DRC and the DFM gate are clean.
@@ -680,7 +686,7 @@ mod tests {
         assert_eq!(core.state.tracks.len(), core.state.nets.len());
         assert!(core.state.violations.is_empty());
 
-        // byte-identical replay holds across the whole 14-phase run.
+        // byte-identical replay holds across the whole 15-phase run.
         let replayed = replay(core.log()).unwrap();
         assert_eq!(core.state, replayed);
         assert_eq!(core.state.canonical_json(), replayed.canonical_json());
@@ -1305,6 +1311,42 @@ mod tests {
         assert_eq!(core.state.violations.len(), raised_before); // no duplicates raised
 
         // replay identity holds across the run + waive + re-verify.
+        let replayed = replay(core.log()).unwrap();
+        assert_eq!(core.state, replayed);
+    }
+
+    #[test]
+    fn manufacturing_blocks_on_open_blocking_violation() {
+        // A load-only design leaves an undriven power net — ERC raises an open, blocking
+        // violation. Manufacturing Generation's GLOBAL gate must refuse to release it.
+        let mut core = RuntimeCore::new(
+            Box::new(MemLog { records: vec![] }),
+            Box::new(LoadOnlyReasoner),
+            Box::new(SeededIdSource::new(7)),
+            Box::new(LogicalClock::new()),
+            Autonomy::Autonomous,
+        );
+        core.capture_intent("battery-only sensor node", "engineer")
+            .unwrap();
+
+        let mut plan = WorkflowPlan::new(vec![
+            Box::new(RequirementPlanningMachine::new()),
+            Box::new(EngineeringAnalysisMachine::new()),
+            Box::new(SchematicPlanningMachine::new()),
+            Box::new(ErcVerificationMachine::new()),
+        ]);
+        let _ = Orchestrator::new().run(&mut plan, &mut core);
+        assert!(!core.state.open_blocking_violations().is_empty());
+
+        // Run Manufacturing Generation directly against that state: the global gate is blocked, so
+        // it fails (Blocked) and generates nothing — no release milestone, state untouched.
+        let violations_before = core.state.violations.len();
+        let mut mfg = ManufacturingGenerationMachine::new();
+        let outcome = ExecutionEngine::new().run(&mut mfg, &mut core);
+        assert!(matches!(outcome, PhaseOutcome::Failed(_)));
+        assert_eq!(core.state.violations.len(), violations_before);
+
+        // replay identity holds across the blocked run.
         let replayed = replay(core.log()).unwrap();
         assert_eq!(core.state, replayed);
     }

@@ -169,6 +169,14 @@ pub enum Event {
         schema_version: u32,
         track_count: usize,
     },
+
+    // ---- Phase 3 (manufacturing): terminal IR / release milestone (audit) ----
+    ManufacturingGenerated {
+        schema_version: u32,
+        place_count: usize,
+        copper_count: usize,
+        line_item_count: usize,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

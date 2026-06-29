@@ -10,8 +10,8 @@ use eak_phases::{
     BomPlanningMachine, BomVerificationMachine, ComponentPlacementMachine,
     ConstraintExtractionMachine, ConstraintVerificationMachine, DfmVerificationMachine,
     DrcVerificationMachine, EmcAnalysisMachine, EngineeringAnalysisMachine, ErcVerificationMachine,
-    PcbFloorPlanningMachine, RequirementPlanningMachine, RoutingPlanningMachine,
-    SchematicPlanningMachine,
+    ManufacturingGenerationMachine, PcbFloorPlanningMachine, RequirementPlanningMachine,
+    RoutingPlanningMachine, SchematicPlanningMachine,
 };
 use eak_ports::ReasoningEngine;
 use eak_reasoning::{Cassette, FixtureEngine};
@@ -142,8 +142,13 @@ pub fn run_with(
 /// Constraint Extraction -> Constraint Verification -> Schematic Planning -> ERC
 /// Verification -> BOM Planning -> BOM Verification -> PCB Floor Planning ->
 /// Component Placement -> Routing Planning -> DRC Verification -> DFM Verification ->
-/// EMC Analysis. Only Requirement Planning reasons (P3); every other phase here is
-/// deterministic, so a run replays bit-identically (P4).
+/// EMC Analysis -> Manufacturing Generation. Only Requirement Planning reasons (P3); every other
+/// phase here is deterministic, so a run replays bit-identically (P4).
+///
+/// Manufacturing Generation is the terminal phase and the GLOBAL gate: it has no loop-back of its
+/// own (it is reached only once every per-phase gate upstream has passed), and it releases the
+/// design — lowering the terminal Manufacturing IR — iff no open blocking violation remains
+/// anywhere; otherwise it reports `Blocked`.
 ///
 /// Six correctness-loop edges bound the self-correction: a failed constraint verification
 /// routes back to extraction, a failed ERC routes back to schematic planning, a failed
@@ -175,6 +180,7 @@ fn default_workflow() -> WorkflowPlan {
             Box::new(DrcVerificationMachine::new()),
             Box::new(DfmVerificationMachine::new()),
             Box::new(EmcAnalysisMachine::new()),
+            Box::new(ManufacturingGenerationMachine::new()),
         ],
         vec![
             LoopBack {

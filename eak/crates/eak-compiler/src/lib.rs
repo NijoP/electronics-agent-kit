@@ -15,6 +15,7 @@ pub const ENGINEERING_IR_SCHEMA_VERSION: u32 = 1;
 pub const SCHEMATIC_IR_SCHEMA_VERSION: u32 = 1;
 pub const BOM_IR_SCHEMA_VERSION: u32 = 1;
 pub const PCB_IR_SCHEMA_VERSION: u32 = 1;
+pub const MANUFACTURING_IR_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IrError {
@@ -30,6 +31,7 @@ pub enum IrError {
     PlacementUnknownComponent(EntityId),
     UnplacedComponent(EntityId),
     TrackUnknownNet(EntityId),
+    UnsourcedPlacement(EntityId),
 }
 impl std::fmt::Display for IrError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -89,6 +91,13 @@ impl std::fmt::Display for IrError {
             }
             IrError::TrackUnknownNet(id) => {
                 write!(f, "track realizes unknown net {}", id.short())
+            }
+            IrError::UnsourcedPlacement(id) => {
+                write!(
+                    f,
+                    "placed component {} is not sourced by any bom line item",
+                    id.short()
+                )
             }
         }
     }
@@ -342,6 +351,85 @@ impl PcbIr {
             placements: placements.to_vec(),
             tracks: tracks.to_vec(),
             components: schematic.components.clone(),
+        })
+    }
+}
+
+/// One assembly placement directive: a placed [`Component`]'s reference designator bound to the
+/// manufacturer part number it is built from. The geometry lives on the matching [`Placement`] in
+/// [`ManufacturingIr::placements`] (keyed by `component`); together they are the pick-and-place
+/// instruction the assembly house consumes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartAssignment {
+    pub component: EntityId,
+    pub refdes: String,
+    pub mpn: String,
+}
+
+/// The sixth and terminal IR: the manufacturing dataset at the boundary out of Manufacturing
+/// Generation — the fabrication outline + copper, the assembly pick-and-place ([`Placement`]
+/// geometry plus the [`PartAssignment`] refdes->MPN binding), and the procurement BOM. Lowered
+/// from the routed [`PcbIr`] and the [`BomIr`] (transformation P1); a projection of canonical
+/// state (P6), never authored. Unlike the upstream IRs this one *joins* two seams — the physical
+/// layout and the bill of materials — so an assembly directive carries both a position and a
+/// part. See `docs/compiler/ir/manufacturing-ir.md`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ManufacturingIr {
+    pub schema_version: u32,
+    pub pcb_ir_schema_version: u32,
+    pub bom_ir_schema_version: u32,
+    pub board: Board,
+    pub placements: Vec<Placement>,
+    pub assignments: Vec<PartAssignment>,
+    pub copper: Vec<Track>,
+    pub line_items: Vec<BomLineItem>,
+}
+
+impl ManufacturingIr {
+    /// Project the routed [`PcbIr`] and the [`BomIr`] into the Manufacturing IR (transformation
+    /// P1), enforcing output completeness: every placed component must resolve to a bom line item
+    /// and an existing part, so every pick-and-place directive carries a real MPN — nothing is
+    /// assembled unsourced (P13). Both seams are re-validated at the join (P3): a placement's
+    /// component must be a real PCB component, and the line it resolves to must order a known part.
+    /// Placements are walked in slice order so the assembly list is deterministic (P4).
+    pub fn project(pcb: &PcbIr, bom: &BomIr) -> Result<Self, IrError> {
+        let mut assignments = Vec::with_capacity(pcb.placements.len());
+        for placement in &pcb.placements {
+            // invariant: the placement binds a real PCB component (P3).
+            let component = pcb
+                .components
+                .iter()
+                .find(|c| c.id == placement.component)
+                .ok_or(IrError::PlacementUnknownComponent(placement.component))?;
+            // invariant: the placed component is sourced by some bom line (P13 — no unsourced
+            // assembly). BomIr already guarantees coverage of every schematic component; this
+            // re-asserts it at the manufacturing join rather than trusting the upstream seam.
+            let line = bom
+                .line_items
+                .iter()
+                .find(|li| li.components.contains(&component.id))
+                .ok_or(IrError::UnsourcedPlacement(component.id))?;
+            // invariant: that line orders a part that exists (P3).
+            let part = bom
+                .parts
+                .iter()
+                .find(|p| p.id == line.part)
+                .ok_or(IrError::UnknownPart(line.part))?;
+            assignments.push(PartAssignment {
+                component: component.id,
+                refdes: component.refdes.clone(),
+                mpn: part.mpn.clone(),
+            });
+        }
+        Ok(Self {
+            schema_version: MANUFACTURING_IR_SCHEMA_VERSION,
+            pcb_ir_schema_version: pcb.schema_version,
+            bom_ir_schema_version: bom.schema_version,
+            board: pcb.board.clone(),
+            placements: pcb.placements.clone(),
+            assignments,
+            copper: pcb.tracks.clone(),
+            line_items: bom.line_items.clone(),
         })
     }
 }
@@ -681,6 +769,56 @@ mod tests {
                 &[track(90, EntityId(99))]
             ),
             Err(IrError::TrackUnknownNet(_))
+        ));
+    }
+
+    #[test]
+    fn manufacturing_project_joins_layout_and_bom() {
+        let sch = routed_schematic();
+        let pcb = PcbIr::project(
+            &sch,
+            Some(&board(80)),
+            &[placement(70, EntityId(20))],
+            &[track(90, EntityId(40))],
+        )
+        .unwrap();
+        let bom = BomIr::project(
+            &sch,
+            &[part(50)],
+            &[line_item(60, EntityId(50), vec![EntityId(20)])],
+        )
+        .unwrap();
+        let mfg = ManufacturingIr::project(&pcb, &bom).unwrap();
+        assert_eq!(mfg.schema_version, MANUFACTURING_IR_SCHEMA_VERSION);
+        assert_eq!(mfg.pcb_ir_schema_version, pcb.schema_version);
+        assert_eq!(mfg.bom_ir_schema_version, bom.schema_version);
+        assert_eq!(mfg.placements.len(), 1);
+        assert_eq!(mfg.copper.len(), 1);
+        // One assembly directive: placed component 20 -> refdes "U1" -> the regulator MPN.
+        assert_eq!(mfg.assignments.len(), 1);
+        assert_eq!(mfg.assignments[0].component, EntityId(20));
+        assert_eq!(mfg.assignments[0].refdes, "U1");
+        assert_eq!(mfg.assignments[0].mpn, "LM1117-3.3");
+    }
+
+    #[test]
+    fn manufacturing_project_rejects_unsourced_placement() {
+        let sch = routed_schematic();
+        let pcb =
+            PcbIr::project(&sch, Some(&board(80)), &[placement(70, EntityId(20))], &[]).unwrap();
+        // A BOM that sources a DIFFERENT component (21), leaving the placed component 20
+        // unsourced. Built directly (BomIr::project would reject the uncovered component first)
+        // so we exercise ManufacturingIr's own completeness invariant at the join.
+        let bom = BomIr {
+            schema_version: BOM_IR_SCHEMA_VERSION,
+            schematic_ir_schema_version: sch.schema_version,
+            parts: vec![part(50)],
+            line_items: vec![line_item(60, EntityId(50), vec![EntityId(21)])],
+            components: sch.components.clone(),
+        };
+        assert!(matches!(
+            ManufacturingIr::project(&pcb, &bom),
+            Err(IrError::UnsourcedPlacement(_))
         ));
     }
 }
