@@ -637,14 +637,14 @@ impl Rule for DrcCourtyardOverlapRule {
 
 /// DRC rule: every routed [`Track`]'s copper `width` must be at least the design's minimum
 /// manufacturable trace width — the fabrication process floor. The floor is read from the
-/// first length-dimensioned target on a [`Regulatory`](RequirementCategory::Regulatory)
-/// requirement (a process/standards constraint, e.g. an IPC trace-width class), mirroring how
-/// floor planning takes the board edge from the first Mechanical length target. A trace finer
-/// than the floor cannot be etched by the chosen process, so it is an Error. With no such
-/// requirement there is no stated process floor, so the rule emits nothing rather than guessing
-/// one — a design that has not pinned a process is not spuriously failed. Comparisons are on
-/// the SI axis via `si_magnitude()` so the check is unit-independent (P9); tracks are scanned in
-/// slice order for determinism.
+/// first length-dimensioned target on a [`Fabrication`](RequirementCategory::Fabrication)
+/// requirement (a process limit, e.g. an IPC trace-width class), mirroring how floor planning
+/// takes the board edge from the first Mechanical length target. A trace finer than the floor
+/// cannot be etched by the chosen process, so it is an Error. With no such requirement there is
+/// no stated process floor, so the rule emits nothing rather than guessing one — a design that
+/// has not pinned a process is not spuriously failed. Comparisons are on the SI axis via
+/// `si_magnitude()` so the check is unit-independent (P9); tracks are scanned in slice order for
+/// determinism.
 pub struct DrcTraceWidthRule;
 
 impl DrcTraceWidthRule {
@@ -666,12 +666,12 @@ impl Rule for DrcTraceWidthRule {
     }
 
     fn evaluate(&self, ctx: &VerificationContext) -> Vec<ViolationFinding> {
-        // The process floor: the first length-dimensioned target on a Regulatory requirement,
+        // The process floor: the first length-dimensioned target on a Fabrication requirement,
         // in commit order. Absent one, there is no floor to check against.
         let Some(floor) = ctx
             .requirements
             .iter()
-            .filter(|r| r.category == RequirementCategory::Regulatory)
+            .filter(|r| r.category == RequirementCategory::Fabrication)
             .flat_map(|r| r.targets.iter())
             .find(|t| t.dimension() == Dimension::Length)
         else {
@@ -695,6 +695,55 @@ impl Rule for DrcTraceWidthRule {
                         track.id.short(),
                         track.width,
                         floor
+                    ),
+                });
+            }
+        }
+        findings
+    }
+}
+
+/// DRC rule: every committed [`Net`] must be realized by at least one routed [`Track`]. An
+/// unrouted net carries no copper, so the nodes it joins are not actually connected on the board
+/// — an electrical break. Routing Planning realizes one track per net, so in a complete layout
+/// this rule is silent; it is the downstream check that makes net-realization *completeness* a
+/// first-class, traceable [`Violation`](eak_domain::Violation) rather than resting solely on the
+/// upstream "every component is placed" invariant (a regression guard, since DRC runs only after
+/// Routing). A flagged net implicates itself (`Violation -> Net -> ... -> Requirement -> Intent`).
+/// Nets are scanned in slice order for determinism.
+pub struct DrcUnroutedNetRule;
+
+impl DrcUnroutedNetRule {
+    pub const ID: &'static str = "drc-unrouted-net";
+
+    pub fn new() -> Self {
+        Self
+    }
+}
+impl Default for DrcUnroutedNetRule {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Rule for DrcUnroutedNetRule {
+    fn id(&self) -> &str {
+        Self::ID
+    }
+
+    fn evaluate(&self, ctx: &VerificationContext) -> Vec<ViolationFinding> {
+        let mut findings = Vec::new();
+        for net in ctx.nets.iter() {
+            let routed = ctx.tracks.iter().any(|t| t.net == net.id);
+            if !routed {
+                findings.push(ViolationFinding {
+                    rule: Self::ID.to_string(),
+                    severity: ViolationSeverity::Error,
+                    subjects: vec![net.id],
+                    message: format!(
+                        "net \"{}\" ({}) is not realized by any routed track",
+                        net.name,
+                        net.id.short()
                     ),
                 });
             }
@@ -1422,13 +1471,13 @@ mod tests {
 
     // ------------------------------ trace-width rule tests ------------------------------
 
-    /// A Regulatory requirement carrying a length target — the fabrication process floor the
+    /// A Fabrication requirement carrying a length target — the fabrication process floor the
     /// trace-width rule reads.
     fn process_floor_req(min_mm: f64) -> Requirement {
         Requirement {
             id: EntityId(700),
             statement: format!("Fabrication process supports a {min_mm} mm minimum trace width"),
-            category: RequirementCategory::Regulatory,
+            category: RequirementCategory::Fabrication,
             priority: Priority::High,
             acceptance_criterion: "all traces meet the process minimum".into(),
             status: RequirementStatus::Accepted,
@@ -1492,11 +1541,77 @@ mod tests {
 
     #[test]
     fn trace_width_is_silent_without_a_process_floor() {
-        // No Regulatory length target: the process floor is unstated, so even a hair-thin trace
+        // No Fabrication length target: the process floor is unstated, so even a hair-thin trace
         // is not flagged rather than guessing a floor.
         let tracks = vec![track(10, 0.05)];
         assert!(DrcTraceWidthRule::new()
             .evaluate(&trace_ctx(&[], &tracks))
+            .is_empty());
+    }
+
+    // ------------------------------ unrouted-net rule tests ------------------------------
+
+    /// A track realizing a specific net (the unrouted-net rule keys on `track.net`).
+    fn track_for_net(id: u128, net_id: u128) -> Track {
+        Track {
+            id: EntityId(id),
+            net: EntityId(net_id),
+            layer: BoardSide::Top,
+            width: mm(0.25),
+            x1: mm(1.0),
+            y1: mm(1.0),
+            x2: mm(9.0),
+            y2: mm(1.0),
+        }
+    }
+
+    fn unrouted_ctx<'a>(nets: &'a [Net], tracks: &'a [Track]) -> VerificationContext<'a> {
+        VerificationContext {
+            requirements: &[],
+            constraints: &[],
+            components: &[],
+            pins: &[],
+            nets,
+            parts: &[],
+            bom_line_items: &[],
+            board: None,
+            placements: &[],
+            tracks,
+        }
+    }
+
+    #[test]
+    fn unrouted_net_is_flagged() {
+        // Net 10 has a track; net 11 has none — only net 11 is an electrical break.
+        let nets = vec![
+            net(10, NetClass::Power, vec![1]),
+            net(11, NetClass::Signal, vec![2]),
+        ];
+        let tracks = vec![track_for_net(100, 10)];
+        let findings = DrcUnroutedNetRule::new().evaluate(&unrouted_ctx(&nets, &tracks));
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule, DrcUnroutedNetRule::ID);
+        assert_eq!(findings[0].severity, ViolationSeverity::Error);
+        assert_eq!(findings[0].subjects, vec![EntityId(11)]);
+    }
+
+    #[test]
+    fn fully_routed_nets_pass() {
+        let nets = vec![
+            net(10, NetClass::Power, vec![1]),
+            net(11, NetClass::Signal, vec![2]),
+        ];
+        let tracks = vec![track_for_net(100, 10), track_for_net(101, 11)];
+        assert!(DrcUnroutedNetRule::new()
+            .evaluate(&unrouted_ctx(&nets, &tracks))
+            .is_empty());
+    }
+
+    #[test]
+    fn unrouted_rule_is_silent_with_no_nets() {
+        // Nothing to realize: a design with no nets has no unrouted nets.
+        assert!(DrcUnroutedNetRule::new()
+            .evaluate(&unrouted_ctx(&[], &[]))
             .is_empty());
     }
 

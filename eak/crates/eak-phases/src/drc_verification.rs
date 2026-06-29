@@ -2,8 +2,9 @@
 //!
 //! Structurally a sibling of [`ErcVerificationMachine`](crate::ErcVerificationMachine), but its
 //! [`VerificationEngine`] is loaded with the DRC rules ([`DrcOutOfBoundsRule`],
-//! [`DrcCourtyardOverlapRule`], [`DrcTraceWidthRule`]) and it runs them over the physical layer
-//! (the board outline, its placements, and the routed tracks). Each *new* finding becomes a
+//! [`DrcCourtyardOverlapRule`], [`DrcTraceWidthRule`], [`DrcUnroutedNetRule`]) and it runs them
+//! over the physical layer (the board outline, its placements, the committed nets, and the routed
+//! tracks). Each *new* finding becomes a
 //! first-class [`Violation`] linked back to the placement(s) or track(s) it implicates so it is
 //! fully traceable to its cause (P3), and the [`Event::VerificationCompleted`] milestone is
 //! recorded. If any blocking (open, error-severity) violation remains — e.g. a courtyard off the
@@ -15,8 +16,8 @@
 
 use eak_domain::{ProvenanceLink, RelationType, Violation, ViolationStatus};
 use eak_engines::{
-    DrcCourtyardOverlapRule, DrcOutOfBoundsRule, DrcTraceWidthRule, VerificationContext,
-    VerificationEngine,
+    DrcCourtyardOverlapRule, DrcOutOfBoundsRule, DrcTraceWidthRule, DrcUnroutedNetRule,
+    VerificationContext, VerificationEngine,
 };
 use eak_ports::Event;
 use eak_runtime::{AgentContext, CapabilityRequest, Machine, MachineError, StepResult};
@@ -28,15 +29,16 @@ impl DrcVerificationMachine {
         Self
     }
 
-    /// The verification engine for this phase: the three Phase-3 DRC rules — two placement
-    /// geometry checks plus the routing trace-width check — registered against the same generic
-    /// framework that Constraint, ERC, and BOM Verification use (reuse: one framework, many
-    /// checks).
+    /// The verification engine for this phase: the four Phase-3 DRC rules — two placement geometry
+    /// checks, the routing trace-width check, and the net-realization completeness check —
+    /// registered against the same generic framework that Constraint, ERC, and BOM Verification
+    /// use (reuse: one framework, many checks).
     fn engine() -> VerificationEngine {
         VerificationEngine::new()
             .with_rule(Box::new(DrcOutOfBoundsRule::new()))
             .with_rule(Box::new(DrcCourtyardOverlapRule::new()))
             .with_rule(Box::new(DrcTraceWidthRule::new()))
+            .with_rule(Box::new(DrcUnroutedNetRule::new()))
     }
 }
 impl Default for DrcVerificationMachine {

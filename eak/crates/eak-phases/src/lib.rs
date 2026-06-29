@@ -818,10 +818,10 @@ mod tests {
     }
 
     /// A reasoner that yields a driven, manufacturable design (a USB-C source + a load, so ERC
-    /// and BOM are clean and the default 100 mm board fits the layout) plus a Regulatory
-    /// fabrication-process requirement carrying a 0.5 mm trace-width floor. The router routes
-    /// every net at the 0.25 mm default, finer than the 0.5 mm process floor, so DRC's
-    /// trace-width rule flags each routed track.
+    /// and BOM are clean and the default 100 mm board fits the layout) plus a Fabrication
+    /// process requirement carrying a 0.5 mm trace-width floor. The router routes every net at
+    /// the 0.25 mm default, finer than the 0.5 mm process floor, so DRC's trace-width rule flags
+    /// each routed track.
     struct TraceFloorReasoner;
     impl ReasoningEngine for TraceFloorReasoner {
         fn model_id(&self) -> String {
@@ -854,12 +854,12 @@ mod tests {
                         rationale: "compute load".into(),
                         targets: vec![],
                     },
-                    // A Regulatory requirement whose length target is the fabrication process's
-                    // minimum trace width — the floor DRC's trace-width rule checks against.
+                    // A Fabrication requirement whose length target is the process's minimum
+                    // trace width — the floor DRC's trace-width rule checks against.
                     CandidateRequirement {
                         statement: "Fabrication process supports a 0.5 mm minimum trace width"
                             .into(),
-                        category: RequirementCategory::Regulatory,
+                        category: RequirementCategory::Fabrication,
                         priority: Priority::High,
                         acceptance_criterion: "every trace is at least 0.5 mm wide".into(),
                         source_hint: "intent: fab process class".into(),
@@ -1225,6 +1225,82 @@ mod tests {
         let raised_before = core.state.violations.len();
         let mut emc = EmcAnalysisMachine::new();
         let outcome = ExecutionEngine::new().run(&mut emc, &mut core);
+        assert_eq!(outcome, PhaseOutcome::Success);
+        assert_eq!(core.state.violations.len(), raised_before); // no duplicates raised
+
+        // replay identity holds across the run + waive + re-verify.
+        let replayed = replay(core.log()).unwrap();
+        assert_eq!(core.state, replayed);
+    }
+
+    #[test]
+    fn drc_flags_unrouted_nets_then_waiver_clears() {
+        let mut core = RuntimeCore::new(
+            Box::new(MemLog { records: vec![] }),
+            Box::new(SourcedReasoner),
+            Box::new(SeededIdSource::new(7)),
+            Box::new(LogicalClock::new()),
+            Autonomy::Autonomous,
+        );
+        core.capture_intent("USB-C powered sensor node, < 5 W", "engineer")
+            .unwrap();
+
+        // Lay the board out fully but DELIBERATELY skip Routing Planning, so the committed nets
+        // exist with no copper realizing them. In the real workflow Routing always runs before
+        // DRC; this exercises the net-realization completeness guard directly.
+        let mut plan = WorkflowPlan::new(vec![
+            Box::new(RequirementPlanningMachine::new()),
+            Box::new(EngineeringAnalysisMachine::new()),
+            Box::new(ConstraintExtractionMachine::new()),
+            Box::new(ConstraintVerificationMachine::new()),
+            Box::new(SchematicPlanningMachine::new()),
+            Box::new(ErcVerificationMachine::new()),
+            Box::new(BomPlanningMachine::new()),
+            Box::new(BomVerificationMachine::new()),
+            Box::new(PcbFloorPlanningMachine::new()),
+            Box::new(ComponentPlacementMachine::new()),
+            Box::new(DrcVerificationMachine::new()),
+        ]);
+        let results = Orchestrator::new().run(&mut plan, &mut core);
+        assert_eq!(results.last().unwrap().0, "DrcVerification");
+        assert!(matches!(results.last().unwrap().1, PhaseOutcome::Failed(_)));
+
+        // Every blocking violation is an unrouted-net finding — one per committed net — and each
+        // names a net (the traceability anchor back through its members to intent).
+        let unrouted: Vec<_> = core
+            .state
+            .violations
+            .iter()
+            .filter(|v| v.rule == "drc-unrouted-net")
+            .collect();
+        assert!(!unrouted.is_empty());
+        assert_eq!(unrouted.len(), core.state.nets.len());
+        assert_eq!(core.state.open_blocking_violations().len(), unrouted.len());
+        for v in &unrouted {
+            assert_eq!(v.subjects.len(), 1);
+            assert!(core.state.net(v.subjects[0]).is_some());
+        }
+
+        // Accept every unrouted-net violation, then re-verify DRC — with the violations waived,
+        // nothing blocks and the phase passes.
+        let vids: Vec<_> = unrouted.iter().map(|v| v.id).collect();
+        for vid in vids {
+            let wid = core.fresh_id();
+            core.invoke(CapabilityRequest::GrantWaiver {
+                waiver: Waiver {
+                    id: wid,
+                    violation: vid,
+                    justification: "nets accepted unrouted for the test".into(),
+                    decided_by: "engineer".into(),
+                },
+            })
+            .expect("waiver granted");
+        }
+        assert!(core.state.open_blocking_violations().is_empty());
+
+        let raised_before = core.state.violations.len();
+        let mut drc = DrcVerificationMachine::new();
+        let outcome = ExecutionEngine::new().run(&mut drc, &mut core);
         assert_eq!(outcome, PhaseOutcome::Success);
         assert_eq!(core.state.violations.len(), raised_before); // no duplicates raised
 

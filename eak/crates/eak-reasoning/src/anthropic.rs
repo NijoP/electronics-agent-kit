@@ -67,6 +67,7 @@ fn map_category(s: &str) -> RequirementCategory {
         "mechanical" => RequirementCategory::Mechanical,
         "thermal" => RequirementCategory::Thermal,
         "regulatory" => RequirementCategory::Regulatory,
+        "fabrication" => RequirementCategory::Fabrication,
         "cost" => RequirementCategory::Cost,
         "schedule" => RequirementCategory::Schedule,
         _ => RequirementCategory::Functional,

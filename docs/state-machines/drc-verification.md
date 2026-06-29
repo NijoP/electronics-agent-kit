@@ -85,6 +85,17 @@ stateDiagram-v2
 - **Indeterminate rule** (insufficient geometry data) is treated as *not passable* ([Verification Engine](../engineering/verification-engine.md) policy).
 - **Expired/out-of-scope waiver** re-arms its covered violation, re-blocking the gate on the next run.
 
+## Phase-3 implementation note
+
+The shipped `DrcVerificationMachine` (in `eak-phases`) runs four deterministic rules on the shared [Verification Engine](../engineering/verification-engine.md) framework over the routed [PCB IR](../compiler/ir/pcb-ir.md):
+
+- `drc-out-of-bounds` — every placement courtyard must lie within the board outline.
+- `drc-courtyard-overlap` — no two same-side courtyards may overlap (AABB, open-set).
+- `drc-trace-width` — every routed track must meet the fabrication **process floor**: the first length target on a [`Fabrication`](../foundation/engineering-domain-model.md) requirement (a process limit — *not* `Regulatory`, which is for external standards/compliance). Silent when no process floor is stated.
+- `drc-unrouted-net` — every committed net must be realized by at least one routed track; an unrouted net is an electrical break. Because Routing Planning runs before DRC and realizes one track per net, this is a completeness *guard* (silent on a normal run) that turns the upstream "every component is placed" invariant into a first-class, traceable violation rather than a silent assumption.
+
+Each finding is raised as a `Violation` linked to the implicated placement/track/net (full provenance to intent), deduped by rule + subjects across loop-back re-verification, and the gate scopes to its **own** rules via `count_open_blocking` (per-phase gating). `Failed` loops back to Routing Planning. The HITL triage/disposition states above are the documented target; the deterministic build raises and gates without an interactive agent.
+
 ## Related documents
 
 [`agents/drc-agent.md`](../agents/drc-agent.md) · [`engineering/verification-engine.md`](../engineering/verification-engine.md) · [`compiler/ir/pcb-ir.md`](../compiler/ir/pcb-ir.md) · [`core/workflow-orchestration.md`](../core/workflow-orchestration.md) · [`state-machines/routing-planning.md`](routing-planning.md) · [`state-machines/dfm-verification.md`](dfm-verification.md) · [`state-machines/README.md`](README.md)

@@ -200,8 +200,8 @@ fn oversize_board_engine() -> Box<dyn ReasoningEngine> {
 
 /// A reasoning engine for the routing trace-width scenario: a USB-C power-entry connector (a
 /// power source, so the rail is driven and ERC is clean) and one electrical load, both with no
-/// targets, plus a Regulatory fabrication-process requirement whose 0.5 mm length target is the
-/// minimum manufacturable trace width. With no Mechanical target the board defaults to a roomy
+/// targets, plus a Fabrication process requirement whose 0.5 mm length target is the minimum
+/// manufacturable trace width. With no Mechanical target the board defaults to a roomy
 /// 100 mm square, so the placement geometry is clean; but Routing Planning routes every net at
 /// the 0.25 mm default — finer than the 0.5 mm process floor — so DRC's trace-width rule flags
 /// each routed track. It is the one fault produced by the routing layer rather than placement.
@@ -228,7 +228,7 @@ fn trace_floor_engine() -> Box<dyn ReasoningEngine> {
     };
     let process = CandidateRequirement {
         statement: "Fabrication process supports a 0.5 mm minimum trace width".into(),
-        category: RequirementCategory::Regulatory,
+        category: RequirementCategory::Fabrication,
         priority: Priority::High,
         acceptance_criterion: "every trace is at least 0.5 mm wide".into(),
         source_hint: "intent: fab process class".into(),

@@ -44,6 +44,11 @@ pub enum RequirementCategory {
     Mechanical,
     Thermal,
     Regulatory,
+    /// Fabrication/assembly *process* limits — what the chosen fab and assembly flow can build
+    /// (minimum trace width, drill sizes, layer count, panelization). Distinct from `Regulatory`
+    /// (external standards/compliance): a process floor is a property of the manufacturer, not a
+    /// regulation. The trace-width DRC floor and future fab/process rules read from this category.
+    Fabrication,
     Cost,
     Schedule,
 }

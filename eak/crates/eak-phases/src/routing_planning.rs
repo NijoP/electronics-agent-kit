@@ -94,10 +94,11 @@ impl Machine for RoutingPlanningMachine {
                         }
                     }
                     // By the same invariants this is unreachable in a well-ordered workflow. If a
-                    // net ever did resolve to no placement it is left unrouted: this increment has
-                    // no unrouted-net DRC rule, so net-realization *completeness* rests on the
-                    // upstream UnplacedComponent guarantee, not a downstream check (a Phase-3
-                    // scope boundary, not a silent gap caught elsewhere).
+                    // net ever did resolve to no placement it is left unrouted here — and that is
+                    // no longer a silent gap: `DrcUnroutedNetRule` raises an `drc-unrouted-net`
+                    // Error for any net not realized by a track, so net-realization completeness is
+                    // enforced downstream by DRC rather than resting solely on the upstream
+                    // UnplacedComponent guarantee.
                     if members.is_empty() {
                         continue;
                     }
