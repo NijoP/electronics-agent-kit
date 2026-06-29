@@ -10,16 +10,31 @@
 //! `docs/state-machines/routing-planning.md`.
 
 use eak_compiler::{EngineeringIr, PcbIr, RequirementIr, SchematicIr};
-use eak_domain::{BoardSide, EntityId, Placement, ProvenanceLink, RelationType, Track};
+use eak_domain::{BoardSide, EntityId, NetClass, Placement, ProvenanceLink, RelationType, Track};
 use eak_ports::Event;
 use eak_runtime::{AgentContext, CapabilityRequest, Machine, MachineError, StepResult};
 use eak_units::{PhysicalQuantity, Unit};
 
-/// The default copper width every trace is routed at, in millimetres. Phase-3 scope: a single
-/// default width keeps routing deterministic before real per-net-class width or current-derived
-/// sizing exists; the trace-width DRC rule still checks each track against the design's
-/// fabrication process floor.
-const TRACE_WIDTH_MM: f64 = 0.25;
+/// Per-net-class default copper widths, in millimetres. Power and ground rails carry more current,
+/// so they default wider than signal traces. Phase-3 scope: a fixed per-class policy (not yet
+/// current-derived or per-net override) — but the resolved width is recorded into the `Track` (and
+/// thus the event stream), so a replay re-folds the identical width and never recomputes it (P4).
+/// Routing stays oblivious to the DRC fabrication floor: a class default finer than the floor is
+/// still flagged downstream by the trace-width rule and looped back, exactly as before.
+const POWER_TRACE_WIDTH_MM: f64 = 0.50;
+const GROUND_TRACE_WIDTH_MM: f64 = 0.50;
+const SIGNAL_TRACE_WIDTH_MM: f64 = 0.25;
+
+/// The default copper width for a net of the given class, in millimetres. An exhaustive match (no
+/// wildcard) so adding a [`NetClass`] variant is a compile error here — a deliberate guard that a
+/// new class must make a width choice rather than silently inherit one.
+fn class_width_mm(class: NetClass) -> f64 {
+    match class {
+        NetClass::Power => POWER_TRACE_WIDTH_MM,
+        NetClass::Ground => GROUND_TRACE_WIDTH_MM,
+        NetClass::Signal => SIGNAL_TRACE_WIDTH_MM,
+    }
+}
 
 pub struct RoutingPlanningMachine;
 
@@ -121,7 +136,7 @@ impl Machine for RoutingPlanningMachine {
                         id: tid,
                         net: net.id,
                         layer: BoardSide::Top,
-                        width: PhysicalQuantity::new(TRACE_WIDTH_MM, Unit::Millimetre),
+                        width: PhysicalQuantity::new(class_width_mm(net.class), Unit::Millimetre),
                         x1: PhysicalQuantity::new(
                             center_mm(first.x, first.width),
                             Unit::Millimetre,
@@ -197,4 +212,31 @@ fn project_pcb(ctx: &mut dyn AgentContext) -> Result<PcbIr, MachineError> {
         .map_err(|e| MachineError::Internal(e.to_string()))?;
     PcbIr::project(&sch_ir, board.as_ref(), &placements, &tracks)
         .map_err(|e| MachineError::Internal(e.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn power_and_ground_default_wider_than_signal() {
+        // The core policy: current-carrying rails default wider than signal traces.
+        assert!(class_width_mm(NetClass::Power) > class_width_mm(NetClass::Signal));
+        assert!(class_width_mm(NetClass::Ground) > class_width_mm(NetClass::Signal));
+        // Power and ground share the wider default; signal keeps the original 0.25 mm.
+        assert_eq!(
+            class_width_mm(NetClass::Power),
+            class_width_mm(NetClass::Ground)
+        );
+        assert_eq!(class_width_mm(NetClass::Signal), 0.25);
+    }
+
+    #[test]
+    fn all_class_widths_are_positive_and_finite() {
+        // Guards Track::validate's positive-finite width invariant for every class.
+        for c in [NetClass::Power, NetClass::Ground, NetClass::Signal] {
+            let w = class_width_mm(c);
+            assert!(w.is_finite() && w > 0.0);
+        }
+    }
 }

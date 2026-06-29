@@ -825,9 +825,9 @@ mod tests {
 
     /// A reasoner that yields a driven, manufacturable design (a USB-C source + a load, so ERC
     /// and BOM are clean and the default 100 mm board fits the layout) plus a Fabrication
-    /// process requirement carrying a 0.5 mm trace-width floor. The router routes every net at
-    /// the 0.25 mm default, finer than the 0.5 mm process floor, so DRC's trace-width rule flags
-    /// each routed track.
+    /// process requirement carrying a 0.75 mm trace-width floor. The router routes every net at
+    /// its per-class default (0.50 mm power/ground), finer than the 0.75 mm process floor, so DRC's
+    /// trace-width rule flags each routed track.
     struct TraceFloorReasoner;
     impl ReasoningEngine for TraceFloorReasoner {
         fn model_id(&self) -> String {
@@ -863,15 +863,15 @@ mod tests {
                     // A Fabrication requirement whose length target is the process's minimum
                     // trace width — the floor DRC's trace-width rule checks against.
                     CandidateRequirement {
-                        statement: "Fabrication process supports a 0.5 mm minimum trace width"
+                        statement: "Fabrication process supports a 0.75 mm minimum trace width"
                             .into(),
                         category: RequirementCategory::Fabrication,
                         priority: Priority::High,
-                        acceptance_criterion: "every trace is at least 0.5 mm wide".into(),
+                        acceptance_criterion: "every trace is at least 0.75 mm wide".into(),
                         source_hint: "intent: fab process class".into(),
                         confidence: 0.9,
                         rationale: "process floor".into(),
-                        targets: vec![PhysicalQuantity::new(0.5, Unit::Millimetre)],
+                        targets: vec![PhysicalQuantity::new(0.75, Unit::Millimetre)],
                     },
                 ],
                 clarifying_questions: vec![],
