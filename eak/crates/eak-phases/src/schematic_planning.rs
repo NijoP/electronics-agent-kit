@@ -139,34 +139,81 @@ impl Machine for SchematicPlanningMachine {
                     }
 
                     // Join the realized pins into first-class nets (P13: connectivity is
-                    // explicit). The power rail collects every source/sink pin; ground every
-                    // ground pin. Each net is committed only if it has members.
-                    //
-                    // FIXME(phase-3-scope): this collapses ALL power pins onto one "VBUS" rail,
-                    // so a regulator's VIN and VOUT land on the same net (an input/output short)
-                    // and multi-rail designs are not separated. Per-block / per-voltage-domain
-                    // rail assignment is a later increment; one rail suffices here to exercise
-                    // the ERC driver/sink rules.
+                    // explicit). Ground collects every ground pin (below); the POWER rails depend
+                    // on whether a regulator is present. WITH a regulator the source feeds the
+                    // regulator's INPUT rail ("VBUS") and the regulator's OUTPUT feeds the loads
+                    // ("VOUT") — two separate single-driver rails, so a regulator's VIN and VOUT no
+                    // longer short onto one net (the old collapsed-rail defect). WITHOUT a regulator
+                    // a single "VBUS" rail collects every power pin (byte-identical to before).
+                    // Rails are committed in the fixed order VBUS -> VOUT -> GND, only if non-empty,
+                    // so the fresh_id sequence and replay stay deterministic (P4). Multi-regulator /
+                    // multi-voltage-domain separation is a later scope.
                     let pins = ctx.pins();
-                    let power_members: Vec<EntityId> = pins
+                    let components = ctx.components();
+                    let class_of = |pin: &Pin| -> Option<ComponentClass> {
+                        components
+                            .iter()
+                            .find(|c| c.id == pin.component)
+                            .map(|c| c.class)
+                    };
+                    let has_regulator = components
                         .iter()
-                        .filter(|p| {
-                            matches!(
-                                p.electrical_type,
-                                PinElectricalType::PowerOut | PinElectricalType::PowerIn
-                            )
-                        })
-                        .map(|p| p.id)
-                        .collect();
-                    if !power_members.is_empty() {
-                        let net = Net {
-                            id: ctx.fresh_id(),
-                            name: "VBUS".into(),
-                            class: NetClass::Power,
-                            members: power_members,
-                        };
-                        ctx.invoke(CapabilityRequest::CreateNet { net, links: vec![] })
-                            .map_err(|e| MachineError::Internal(e.to_string()))?;
+                        .any(|c| c.class == ComponentClass::Regulator);
+
+                    let mut rails: Vec<(&str, Vec<EntityId>)> = Vec::new();
+                    if has_regulator {
+                        // Input rail: source drivers (connector PowerOut) + regulator inputs (VIN).
+                        let vbus = pins
+                            .iter()
+                            .filter(|p| {
+                                let c = class_of(p);
+                                (p.electrical_type == PinElectricalType::PowerOut
+                                    && c == Some(ComponentClass::Connector))
+                                    || (p.electrical_type == PinElectricalType::PowerIn
+                                        && c == Some(ComponentClass::Regulator))
+                            })
+                            .map(|p| p.id)
+                            .collect();
+                        // Output rail: regulator drivers (VOUT) + load inputs (every non-regulator
+                        // PowerIn — an IC's VDD).
+                        let vout = pins
+                            .iter()
+                            .filter(|p| {
+                                let c = class_of(p);
+                                (p.electrical_type == PinElectricalType::PowerOut
+                                    && c == Some(ComponentClass::Regulator))
+                                    || (p.electrical_type == PinElectricalType::PowerIn
+                                        && c != Some(ComponentClass::Regulator))
+                            })
+                            .map(|p| p.id)
+                            .collect();
+                        rails.push(("VBUS", vbus));
+                        rails.push(("VOUT", vout));
+                    } else {
+                        let vbus = pins
+                            .iter()
+                            .filter(|p| {
+                                matches!(
+                                    p.electrical_type,
+                                    PinElectricalType::PowerOut | PinElectricalType::PowerIn
+                                )
+                            })
+                            .map(|p| p.id)
+                            .collect();
+                        rails.push(("VBUS", vbus));
+                    }
+
+                    for (name, members) in rails {
+                        if !members.is_empty() {
+                            let net = Net {
+                                id: ctx.fresh_id(),
+                                name: name.into(),
+                                class: NetClass::Power,
+                                members,
+                            };
+                            ctx.invoke(CapabilityRequest::CreateNet { net, links: vec![] })
+                                .map_err(|e| MachineError::Internal(e.to_string()))?;
+                        }
                     }
 
                     let ground_members: Vec<EntityId> = pins

@@ -113,13 +113,23 @@ fn load_only_engine() -> Box<dyn ReasoningEngine> {
     }))
 }
 
-/// A reasoning engine returning a voltage-regulator requirement plus one plain load, both with
-/// no physical targets (so no constraints, so the constraint gate is clean). Schematic Planning
-/// recognizes the "voltage regulator" wording and realizes a regulator component — its VOUT pin
-/// drives the rail, so ERC is clean and the workflow reaches the BOM layer. BOM Planning then
-/// resolves that regulator to its catalog part, the deliberately end-of-life LM1117-3.3, so the
-/// BOM lifecycle gate fails.
+/// A reasoning engine returning a USB-C source, a voltage-regulator requirement, and one plain
+/// load, all with no physical targets (so no constraints, so the constraint gate is clean).
+/// Schematic Planning realizes a connector that drives the regulator's VBUS input rail and a
+/// regulator whose VOUT drives the load rail, so both rails are single-driver and ERC is clean and
+/// the workflow reaches the BOM layer. BOM Planning then resolves that regulator to its catalog
+/// part, the deliberately end-of-life LM1117-3.3, so the BOM lifecycle gate fails.
 fn regulator_and_load_engine() -> Box<dyn ReasoningEngine> {
+    let usb_c = CandidateRequirement {
+        statement: "Device shall be powered over USB-C".into(),
+        category: RequirementCategory::Functional,
+        priority: Priority::High,
+        acceptance_criterion: "the device draws power through a USB-C receptacle".into(),
+        source_hint: "intent: USB-C power entry".into(),
+        confidence: 0.9,
+        rationale: "USB-C is the stated power interface".into(),
+        targets: vec![],
+    };
     let regulator = CandidateRequirement {
         statement: "Board shall include a 3.3 V voltage regulator".into(),
         category: RequirementCategory::Functional,
@@ -141,7 +151,7 @@ fn regulator_and_load_engine() -> Box<dyn ReasoningEngine> {
         targets: vec![],
     };
     Box::new(FixtureEngine::single(ReasoningResponse {
-        candidates: vec![regulator, load],
+        candidates: vec![usb_c, regulator, load],
         clarifying_questions: vec![],
         raw: "{}".into(),
     }))

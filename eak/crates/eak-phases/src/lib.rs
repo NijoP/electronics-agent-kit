@@ -38,7 +38,7 @@ pub use schematic_planning::SchematicPlanningMachine;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eak_domain::{Priority, RequirementCategory, ViolationStatus, Waiver};
+    use eak_domain::{NetClass, Priority, RequirementCategory, ViolationStatus, Waiver};
     use eak_ports::{
         CandidateRequirement, Event, EventLog, EventRecord, ReasoningEngine, ReasoningError,
         ReasoningRequest, ReasoningResponse, Seq, StoreError, Timestamp,
@@ -528,9 +528,10 @@ mod tests {
         assert_eq!(core.state.canonical_json(), replayed.canonical_json());
     }
 
-    /// A reasoner that yields a voltage-regulator block (which drives a downstream rail, so the
-    /// ERC is clean) plus an electrical load. The regulator's catalog part is end-of-life, so
-    /// the BOM gate flags it while the ERC passes.
+    /// A reasoner that yields a USB-C source (driving the regulator's VBUS input rail), a
+    /// voltage-regulator block (whose VOUT drives the downstream load rail), and an electrical
+    /// load. Both power rails are single-driver so the ERC is clean; the regulator's catalog part
+    /// is end-of-life, so the BOM gate flags it while the ERC passes.
     struct RegulatorReasoner;
     impl ReasoningEngine for RegulatorReasoner {
         fn model_id(&self) -> String {
@@ -542,6 +543,16 @@ mod tests {
         ) -> Result<ReasoningResponse, ReasoningError> {
             Ok(ReasoningResponse {
                 candidates: vec![
+                    CandidateRequirement {
+                        statement: "USB-C connector shall supply 5 V to the board".into(),
+                        category: RequirementCategory::Functional,
+                        priority: Priority::High,
+                        acceptance_criterion: "VBUS present at 5 V".into(),
+                        source_hint: "intent: USB-C power entry".into(),
+                        confidence: 0.9,
+                        rationale: "power entry".into(),
+                        targets: vec![],
+                    },
                     CandidateRequirement {
                         statement: "Voltage regulator shall provide a 3.3 V rail".into(),
                         category: RequirementCategory::Functional,
@@ -1347,6 +1358,48 @@ mod tests {
         assert_eq!(core.state.violations.len(), violations_before);
 
         // replay identity holds across the blocked run.
+        let replayed = replay(core.log()).unwrap();
+        assert_eq!(core.state, replayed);
+    }
+
+    #[test]
+    fn regulator_design_splits_power_into_input_and_output_rails() {
+        // A USB-C source + regulator + load: the regulator's VIN and VOUT must land on SEPARATE
+        // single-driver rails (VBUS input, VOUT output), not the old collapsed VBUS — and ERC must
+        // pass cleanly (no undriven rail, no contended multiple-driver rail).
+        let mut core = RuntimeCore::new(
+            Box::new(MemLog { records: vec![] }),
+            Box::new(RegulatorReasoner),
+            Box::new(SeededIdSource::new(7)),
+            Box::new(LogicalClock::new()),
+            Autonomy::Autonomous,
+        );
+        core.capture_intent("USB-C regulated sensor node", "engineer")
+            .unwrap();
+        let mut plan = WorkflowPlan::new(vec![
+            Box::new(RequirementPlanningMachine::new()),
+            Box::new(EngineeringAnalysisMachine::new()),
+            Box::new(SchematicPlanningMachine::new()),
+            Box::new(ErcVerificationMachine::new()),
+        ]);
+        let results = Orchestrator::new().run(&mut plan, &mut core);
+
+        // ERC clean — the split kills both the VIN/VOUT short and the latent multiple-driver
+        // false-positive a collapsed source+regulator rail would have raised.
+        assert!(results.iter().all(|(_, o)| *o == PhaseOutcome::Success));
+        assert!(core.state.violations.is_empty());
+        // Exactly two Power rails, named VBUS (input) and VOUT (output), plus the GND net.
+        let power = core
+            .state
+            .nets
+            .iter()
+            .filter(|n| n.class == NetClass::Power)
+            .count();
+        assert_eq!(power, 2);
+        assert!(core.state.nets.iter().any(|n| n.name == "VBUS"));
+        assert!(core.state.nets.iter().any(|n| n.name == "VOUT"));
+
+        // replay identity holds across the split-rail synthesis.
         let replayed = replay(core.log()).unwrap();
         assert_eq!(core.state, replayed);
     }
