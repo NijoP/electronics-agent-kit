@@ -9,7 +9,7 @@ use eak_domain::RelationType;
 use eak_phases::{
     BomPlanningMachine, BomVerificationMachine, ComponentPlacementMachine,
     ConstraintExtractionMachine, ConstraintVerificationMachine, DfmVerificationMachine,
-    DrcVerificationMachine, EngineeringAnalysisMachine, ErcVerificationMachine,
+    DrcVerificationMachine, EmcAnalysisMachine, EngineeringAnalysisMachine, ErcVerificationMachine,
     PcbFloorPlanningMachine, RequirementPlanningMachine, RoutingPlanningMachine,
     SchematicPlanningMachine,
 };
@@ -141,22 +141,23 @@ pub fn run_with(
 /// The default Phase-3 workflow: Requirement Planning -> Engineering Analysis ->
 /// Constraint Extraction -> Constraint Verification -> Schematic Planning -> ERC
 /// Verification -> BOM Planning -> BOM Verification -> PCB Floor Planning ->
-/// Component Placement -> Routing Planning -> DRC Verification -> DFM Verification. Only
-/// Requirement Planning reasons (P3); every other phase here is deterministic, so a run replays
-/// bit-identically (P4).
+/// Component Placement -> Routing Planning -> DRC Verification -> DFM Verification ->
+/// EMC Analysis. Only Requirement Planning reasons (P3); every other phase here is
+/// deterministic, so a run replays bit-identically (P4).
 ///
-/// Five correctness-loop edges bound the self-correction: a failed constraint verification
+/// Six correctness-loop edges bound the self-correction: a failed constraint verification
 /// routes back to extraction, a failed ERC routes back to schematic planning, a failed
 /// BOM verification routes back to BOM planning, a failed DRC routes back to routing planning
-/// (clearance/geometry defects are routing defects), and a failed DFM routes back to component
-/// placement (manufacturability defects are usually placement-driven) — each the canonical
-/// loop-back target, capped at `max_retries` 2. Because extraction, schematic planning, BOM
-/// planning, routing planning, and component placement are *idempotent* (a re-entry produces the
-/// identical artifact), the loop is a no-op recovery for a design that is genuinely infeasible:
-/// it deterministically exhausts the retries and then surfaces the open, blocking violation
-/// rather than looping forever (P13). The loop-back is the seam where a future reasoning-assisted
-/// re-synthesis (or a human waiver between passes) can actually change the artifact and clear the
-/// violation.
+/// (clearance/geometry defects are routing defects), a failed DFM routes back to component
+/// placement (manufacturability defects are usually placement-driven), and a failed EMC analysis
+/// routes back to routing planning (emissions/coupling are routing-dominated — a re-route is what
+/// changes the trace geometry) — each the canonical loop-back target, capped at `max_retries` 2.
+/// Because extraction, schematic planning, BOM planning, routing planning, and component placement
+/// are *idempotent* (a re-entry produces the identical artifact), the loop is a no-op recovery for
+/// a design that is genuinely infeasible: it deterministically exhausts the retries and then
+/// surfaces the open, blocking violation rather than looping forever (P13). The loop-back is the
+/// seam where a future reasoning-assisted re-synthesis (or a human waiver between passes) can
+/// actually change the artifact and clear the violation.
 fn default_workflow() -> WorkflowPlan {
     WorkflowPlan::with_loopbacks(
         vec![
@@ -173,6 +174,7 @@ fn default_workflow() -> WorkflowPlan {
             Box::new(RoutingPlanningMachine::new()),
             Box::new(DrcVerificationMachine::new()),
             Box::new(DfmVerificationMachine::new()),
+            Box::new(EmcAnalysisMachine::new()),
         ],
         vec![
             LoopBack {
@@ -198,6 +200,11 @@ fn default_workflow() -> WorkflowPlan {
             LoopBack {
                 from: "DfmVerification".into(),
                 to: "ComponentPlacement".into(),
+                max_retries: 2,
+            },
+            LoopBack {
+                from: "EmcAnalysis".into(),
+                to: "RoutingPlanning".into(),
                 max_retries: 2,
             },
         ],

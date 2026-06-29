@@ -824,6 +824,132 @@ impl Rule for DfmTraceEdgeClearanceRule {
     }
 }
 
+// ================================== EMC Rules ==================================
+
+/// Free-space speed of light, in metres per second — the propagation speed used to size the
+/// electrically-long threshold. This is a deliberately *lenient* first-order model: a real
+/// signal on an FR-4 microstrip travels at roughly `c / sqrt(eps_eff)` (~half `c`), so its
+/// on-board wavelength — and therefore its critical length — is SHORTER than the free-space
+/// figure. Using the free-space value can only *under*-report emission risk, never invent it; a
+/// velocity-factor refinement (an effective-permittivity term) would tighten the limit and is a
+/// noted Phase-3 scope boundary.
+const SPEED_OF_LIGHT_M_S: f64 = 299_792_458.0;
+
+/// The "electrically long" fraction of a wavelength. A conductor longer than about one tenth of
+/// the wavelength at the signal's frequency stops behaving as a lumped wire and radiates
+/// efficiently / must be treated as a transmission line — the classic lambda/10 EMC rule of
+/// thumb. The critical length is therefore `c / (ELECTRICAL_LENGTH_DIVISOR * f)`.
+const ELECTRICAL_LENGTH_DIVISOR: f64 = 10.0;
+
+/// EMC rule: a routed [`Track`] longer than the design's *electrically-long* threshold — one
+/// tenth of the wavelength at the highest stated operating/emission frequency — is an efficient
+/// radiator and a radiated-emissions risk, so it is an Error. The frequency is the largest
+/// [`Frequency`](Dimension::Frequency)-dimensioned target across all requirements (the worst
+/// case: the highest frequency gives the shortest wavelength and so the tightest limit). It is a
+/// *different dimension* than the trace-width rule's length floor, so the two rules never
+/// contend for the same target. With no frequency stated the design has not pinned an emission
+/// spectrum, so the rule emits nothing rather than guessing one — mirroring how the trace-width
+/// rule stays silent without a process floor. A track's length is the straight-line distance
+/// between its endpoints on the SI axis (P9); tracks are scanned in slice order for determinism.
+///
+/// EMC is *analysis*, not pass/fail rule-checking in the full lifecycle (it interprets simulated
+/// fields against limits — see `docs/state-machines/emc-analysis.md`). This rule is the
+/// deterministic Phase-3 subset: a closed-form geometric proxy for the dominant emission
+/// mechanism (an electrically-long trace acting as an antenna), evaluated on the same
+/// [`Rule`] framework as ERC/DRC/DFM. Its `Failed` terminal loops back to Routing Planning —
+/// the trace geometry is what a re-route changes.
+pub struct EmcAntennaLengthRule;
+
+impl EmcAntennaLengthRule {
+    pub const ID: &'static str = "emc-antenna-length";
+
+    pub fn new() -> Self {
+        Self
+    }
+}
+impl Default for EmcAntennaLengthRule {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Rule for EmcAntennaLengthRule {
+    fn id(&self) -> &str {
+        Self::ID
+    }
+
+    fn evaluate(&self, ctx: &VerificationContext) -> Vec<ViolationFinding> {
+        // Every stated frequency target and the requirement that carries it. ABSENT any frequency
+        // the design has not pinned an emission spectrum, so the rule is silent (mirroring the
+        // trace-width rule without a process floor).
+        let freq_targets: Vec<(&Requirement, f64)> = ctx
+            .requirements
+            .iter()
+            .flat_map(|r| r.targets.iter().map(move |t| (r, t)))
+            .filter(|(_, t)| t.dimension() == Dimension::Frequency)
+            .map(|(r, t)| (r, t.si_magnitude()))
+            .collect();
+        if freq_targets.is_empty() {
+            return Vec::new();
+        }
+
+        // The worst-case (highest) usable frequency gives the shortest wavelength and so the
+        // tightest limit. `total_cmp` is a total order over the already finite, positive set.
+        let max_valid = freq_targets
+            .iter()
+            .map(|(_, f)| *f)
+            .filter(|f| f.is_finite() && *f > 0.0)
+            .max_by(|a, b| a.total_cmp(b));
+        let Some(freq_si) = max_valid else {
+            // A frequency is stated but NONE is finite and positive: a malformed spectrum. Do not
+            // behave as if no frequency were given (which would silently pass an electrically-long
+            // design) — surface it as a blocking finding against the requirement(s) at fault, so
+            // the bad datum is loud and traceable (P9 — no silent errors).
+            let mut subjects: Vec<EntityId> = freq_targets.iter().map(|(r, _)| r.id).collect();
+            subjects.sort();
+            subjects.dedup();
+            return vec![ViolationFinding {
+                rule: Self::ID.to_string(),
+                severity: ViolationSeverity::Error,
+                subjects,
+                message: "a stated operating/emission frequency is non-positive or non-finite; \
+                          the EMC antenna-length analysis cannot be performed"
+                    .to_string(),
+            }];
+        };
+        let critical_len = SPEED_OF_LIGHT_M_S / (ELECTRICAL_LENGTH_DIVISOR * freq_si);
+        let mut findings = Vec::new();
+        for track in ctx.tracks.iter() {
+            // Straight-line copper length on the SI axis. `hypot` avoids overflow and is exact
+            // for the axis-aligned and diagonal single segments the router currently mints.
+            let dx = track.x2.si_magnitude() - track.x1.si_magnitude();
+            let dy = track.y2.si_magnitude() - track.y1.si_magnitude();
+            let len = dx.hypot(dy);
+            // Over the limit by more than a relative epsilon, so a track exactly at the critical
+            // length (floating-point) is never a false violation — the same tolerance shape the
+            // trace-width rule uses.
+            let scale = len.abs().max(critical_len.abs()).max(1.0);
+            if len - critical_len > 1e-9 * scale {
+                findings.push(ViolationFinding {
+                    rule: Self::ID.to_string(),
+                    severity: ViolationSeverity::Error,
+                    subjects: vec![track.id],
+                    message: format!(
+                        "track {} length {:.1} mm exceeds the {:.1} mm electrically-long limit \
+                         (1/{:.0} wavelength at {:.0} MHz)",
+                        track.id.short(),
+                        len * 1e3,
+                        critical_len * 1e3,
+                        ELECTRICAL_LENGTH_DIVISOR,
+                        freq_si / 1e6
+                    ),
+                });
+            }
+        }
+        findings
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1468,5 +1594,125 @@ mod tests {
         assert!(DfmTraceEdgeClearanceRule::new()
             .evaluate(&dfm_track_ctx(None, &tracks))
             .is_empty());
+    }
+
+    // -------------------------------- EMC rule tests --------------------------------
+
+    /// A requirement carrying a frequency target — the highest operating/emission frequency the
+    /// antenna-length rule sizes its critical length against. The rule scans EVERY requirement's
+    /// targets, so the category is irrelevant; `Electrical` stands in for a high-speed signal.
+    fn freq_req(mhz: f64) -> Requirement {
+        Requirement {
+            id: EntityId(710),
+            statement: format!("High-speed interface operates at {mhz} MHz"),
+            category: RequirementCategory::Electrical,
+            priority: Priority::High,
+            acceptance_criterion: "emissions assessed at the stated frequency".into(),
+            status: RequirementStatus::Accepted,
+            source: EntityId(1),
+            targets: vec![PhysicalQuantity::new(mhz, Unit::Megahertz)],
+        }
+    }
+
+    fn emc_ctx<'a>(
+        requirements: &'a [Requirement],
+        tracks: &'a [Track],
+    ) -> VerificationContext<'a> {
+        VerificationContext {
+            requirements,
+            constraints: &[],
+            components: &[],
+            pins: &[],
+            nets: &[],
+            parts: &[],
+            bom_line_items: &[],
+            board: None,
+            placements: &[],
+            tracks,
+        }
+    }
+
+    #[test]
+    fn track_longer_than_a_tenth_wavelength_is_flagged() {
+        // `track` spans (1,1) -> (9,1) mm = 8 mm of copper. At 10 GHz the free-space wavelength
+        // is 30 mm, so the lambda/10 critical length is 3 mm: an 8 mm trace is electrically long.
+        let reqs = vec![freq_req(10_000.0)];
+        let tracks = vec![track(10, 0.25)];
+        let findings = EmcAntennaLengthRule::new().evaluate(&emc_ctx(&reqs, &tracks));
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule, EmcAntennaLengthRule::ID);
+        assert_eq!(findings[0].severity, ViolationSeverity::Error);
+        assert_eq!(findings[0].subjects, vec![EntityId(10)]);
+    }
+
+    #[test]
+    fn electrically_short_track_passes() {
+        // At 100 MHz the wavelength is 3 m, so the critical length is 300 mm: an 8 mm trace is
+        // electrically short and well within the limit.
+        let reqs = vec![freq_req(100.0)];
+        let tracks = vec![track(10, 0.25)];
+        assert!(EmcAntennaLengthRule::new()
+            .evaluate(&emc_ctx(&reqs, &tracks))
+            .is_empty());
+    }
+
+    #[test]
+    fn antenna_rule_is_silent_without_a_stated_frequency() {
+        // No frequency target: the emission spectrum is unstated, so even a long trace is not
+        // flagged rather than guessing a frequency — paralleling the trace-width rule's silence
+        // without a process floor.
+        let tracks = vec![track(10, 0.25)];
+        assert!(EmcAntennaLengthRule::new()
+            .evaluate(&emc_ctx(&[], &tracks))
+            .is_empty());
+    }
+
+    #[test]
+    fn antenna_rule_sizes_its_limit_from_the_highest_frequency() {
+        // Two frequencies stated; the worst case (10 GHz -> 3 mm) governs, under which the 8 mm
+        // trace fails — even though the 100 MHz limit (300 mm) alone would pass it.
+        let reqs = vec![freq_req(100.0), freq_req(10_000.0)];
+        let tracks = vec![track(10, 0.25)];
+        let findings = EmcAntennaLengthRule::new().evaluate(&emc_ctx(&reqs, &tracks));
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].subjects, vec![EntityId(10)]);
+    }
+
+    #[test]
+    fn track_at_exactly_the_critical_length_is_not_flagged() {
+        // Pin the documented guarantee: a trace exactly at lambda/10 is never a false positive.
+        // Build a horizontal track whose length equals the critical length at 10 GHz to f64
+        // precision, computed from the SAME constants the rule uses (so the test tracks the impl).
+        let freq_si = 10_000.0_f64 * 1e6; // 10 GHz in Hz
+        let critical_mm = (SPEED_OF_LIGHT_M_S / (ELECTRICAL_LENGTH_DIVISOR * freq_si)) * 1e3;
+        let reqs = vec![freq_req(10_000.0)];
+        let exact = Track {
+            id: EntityId(10),
+            net: EntityId(910),
+            layer: BoardSide::Top,
+            width: mm(0.25),
+            x1: mm(0.0),
+            y1: mm(0.0),
+            x2: mm(critical_mm),
+            y2: mm(0.0),
+        };
+        assert!(EmcAntennaLengthRule::new()
+            .evaluate(&emc_ctx(&reqs, &[exact]))
+            .is_empty());
+    }
+
+    #[test]
+    fn malformed_frequency_is_surfaced_not_silently_skipped() {
+        // A frequency target is stated but its magnitude is non-positive (0 MHz). The design must
+        // NOT pass EMC silently as if no frequency were given — the bad spectrum is flagged as a
+        // blocking error against the offending requirement, even though the tracks are never
+        // measured against a (here, undefined) limit.
+        let reqs = vec![freq_req(0.0)];
+        let tracks = vec![track(10, 0.25)];
+        let findings = EmcAntennaLengthRule::new().evaluate(&emc_ctx(&reqs, &tracks));
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule, EmcAntennaLengthRule::ID);
+        assert_eq!(findings[0].severity, ViolationSeverity::Error);
+        assert_eq!(findings[0].subjects, vec![EntityId(710)]); // the offending requirement
     }
 }

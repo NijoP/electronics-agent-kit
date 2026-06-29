@@ -9,6 +9,7 @@ pub mod constraint_extraction;
 pub mod constraint_verification;
 pub mod dfm_verification;
 pub mod drc_verification;
+pub mod emc_analysis;
 pub mod engineering_analysis;
 pub mod erc_verification;
 pub mod pcb_floor_planning;
@@ -24,6 +25,7 @@ pub use constraint_extraction::ConstraintExtractionMachine;
 pub use constraint_verification::ConstraintVerificationMachine;
 pub use dfm_verification::DfmVerificationMachine;
 pub use drc_verification::DrcVerificationMachine;
+pub use emc_analysis::EmcAnalysisMachine;
 pub use engineering_analysis::EngineeringAnalysisMachine;
 pub use erc_verification::ErcVerificationMachine;
 pub use pcb_floor_planning::PcbFloorPlanningMachine;
@@ -644,7 +646,7 @@ mod tests {
         core.capture_intent("USB-C powered sensor node, < 5 W", "engineer")
             .unwrap();
 
-        // The full 11-phase chain, run linearly (each phase succeeds, so no loop-back fires).
+        // The full 14-phase chain, run linearly (each phase succeeds, so no loop-back fires).
         let mut plan = WorkflowPlan::new(vec![
             Box::new(RequirementPlanningMachine::new()),
             Box::new(EngineeringAnalysisMachine::new()),
@@ -659,10 +661,11 @@ mod tests {
             Box::new(RoutingPlanningMachine::new()),
             Box::new(DrcVerificationMachine::new()),
             Box::new(DfmVerificationMachine::new()),
+            Box::new(EmcAnalysisMachine::new()),
         ]);
         let results = Orchestrator::new().run(&mut plan, &mut core);
 
-        assert_eq!(results.len(), 13);
+        assert_eq!(results.len(), 14);
         assert!(results.iter().all(|(_, o)| *o == PhaseOutcome::Success));
         // The PCB layer exists: an outline plus one placement per realized component, all
         // within bounds, non-overlapping, and clear of the board-edge keep-out, so both the
@@ -671,12 +674,13 @@ mod tests {
         assert!(!core.state.placements.is_empty());
         assert_eq!(core.state.placements.len(), core.state.components.len());
         // The routing layer exists: every net is realized by exactly one track, and with no
-        // process floor stated the trace-width DRC is clean too.
+        // process floor stated the trace-width DRC is clean too. With no operating frequency
+        // stated, the EMC antenna-length analysis is silent as well.
         assert!(!core.state.tracks.is_empty());
         assert_eq!(core.state.tracks.len(), core.state.nets.len());
         assert!(core.state.violations.is_empty());
 
-        // byte-identical replay holds across the whole 13-phase run.
+        // byte-identical replay holds across the whole 14-phase run.
         let replayed = replay(core.log()).unwrap();
         assert_eq!(core.state, replayed);
         assert_eq!(core.state.canonical_json(), replayed.canonical_json());
@@ -1019,9 +1023,10 @@ mod tests {
         core.capture_intent("USB-C sensor node in a snug enclosure", "engineer")
             .unwrap();
 
-        // Run the full 13-phase chain linearly. ERC, BOM, and DRC are clean (a driven rail,
-        // Active parts, every courtyard inside the outline), but the trailing component hugs the
-        // board edge, so DFM fails on the edge-clearance rule and the linear plan stops there.
+        // Run the 13-phase chain through DFM linearly (EMC is exercised separately below). ERC,
+        // BOM, and DRC are clean (a driven rail, Active parts, every courtyard inside the outline),
+        // but the trailing component hugs the board edge, so DFM fails on the edge-clearance rule
+        // and the linear plan stops there.
         let mut plan = WorkflowPlan::new(vec![
             Box::new(RequirementPlanningMachine::new()),
             Box::new(EngineeringAnalysisMachine::new()),
@@ -1079,6 +1084,149 @@ mod tests {
         assert_eq!(outcome, PhaseOutcome::Success);
         assert_eq!(core.state.violations.len(), 1); // no duplicate raised
         assert_eq!(core.state.waivers.len(), 1);
+
+        // replay identity holds across the run + waive + re-verify.
+        let replayed = replay(core.log()).unwrap();
+        assert_eq!(core.state, replayed);
+    }
+
+    /// A reasoner that yields a driven, manufacturable design (a USB-C source + a load, so ERC and
+    /// BOM are clean and the default 100 mm board fits the layout, so DRC and DFM are clean too)
+    /// plus a high-speed-link requirement carrying a 10 GHz frequency target. Routing realizes every
+    /// net as a centroid-to-centroid track far longer than the lambda/10 electrically-long limit
+    /// (3 mm at 10 GHz), so EMC Analysis flags each routed track.
+    struct HighSpeedReasoner;
+    impl ReasoningEngine for HighSpeedReasoner {
+        fn model_id(&self) -> String {
+            "high-speed".into()
+        }
+        fn request_judgement(
+            &self,
+            _req: &ReasoningRequest,
+        ) -> Result<ReasoningResponse, ReasoningError> {
+            use eak_units::{PhysicalQuantity, Unit};
+            Ok(ReasoningResponse {
+                candidates: vec![
+                    CandidateRequirement {
+                        statement: "USB-C connector shall supply 5 V to the board".into(),
+                        category: RequirementCategory::Functional,
+                        priority: Priority::High,
+                        acceptance_criterion: "VBUS present at 5 V".into(),
+                        source_hint: "intent: USB-C power entry".into(),
+                        confidence: 0.9,
+                        rationale: "power entry".into(),
+                        targets: vec![],
+                    },
+                    CandidateRequirement {
+                        statement: "Microcontroller shall run the sensing firmware".into(),
+                        category: RequirementCategory::Electrical,
+                        priority: Priority::High,
+                        acceptance_criterion: "firmware boots and samples".into(),
+                        source_hint: "intent: sensing load".into(),
+                        confidence: 0.9,
+                        rationale: "compute load".into(),
+                        targets: vec![],
+                    },
+                    CandidateRequirement {
+                        statement: "High-speed serial link shall operate at 10 GHz".into(),
+                        category: RequirementCategory::Electrical,
+                        priority: Priority::High,
+                        acceptance_criterion: "radiated emissions assessed at the 10 GHz line rate"
+                            .into(),
+                        source_hint: "intent: high-speed link".into(),
+                        confidence: 0.9,
+                        rationale: "multi-gigabit serial line sets the emission spectrum".into(),
+                        targets: vec![PhysicalQuantity::new(10_000.0, Unit::Megahertz)],
+                    },
+                ],
+                clarifying_questions: vec![],
+                raw: "{}".into(),
+            })
+        }
+    }
+
+    #[test]
+    fn emc_antenna_length_waiver_lets_reverification_pass() {
+        let mut core = RuntimeCore::new(
+            Box::new(MemLog { records: vec![] }),
+            Box::new(HighSpeedReasoner),
+            Box::new(SeededIdSource::new(7)),
+            Box::new(LogicalClock::new()),
+            Autonomy::Autonomous,
+        );
+        core.capture_intent(
+            "USB-C sensor node with a 10 GHz high-speed link",
+            "engineer",
+        )
+        .unwrap();
+
+        // Run the full 14-phase chain linearly. ERC, BOM, DRC, and DFM are clean (a driven rail,
+        // Active parts, a roomy default board), but every routed trace is electrically long at
+        // 10 GHz, so EMC Analysis fails on the antenna-length rule and the linear plan stops there.
+        let mut plan = WorkflowPlan::new(vec![
+            Box::new(RequirementPlanningMachine::new()),
+            Box::new(EngineeringAnalysisMachine::new()),
+            Box::new(ConstraintExtractionMachine::new()),
+            Box::new(ConstraintVerificationMachine::new()),
+            Box::new(SchematicPlanningMachine::new()),
+            Box::new(ErcVerificationMachine::new()),
+            Box::new(BomPlanningMachine::new()),
+            Box::new(BomVerificationMachine::new()),
+            Box::new(PcbFloorPlanningMachine::new()),
+            Box::new(ComponentPlacementMachine::new()),
+            Box::new(RoutingPlanningMachine::new()),
+            Box::new(DrcVerificationMachine::new()),
+            Box::new(DfmVerificationMachine::new()),
+            Box::new(EmcAnalysisMachine::new()),
+        ]);
+        let results = Orchestrator::new().run(&mut plan, &mut core);
+        assert_eq!(results.len(), 14);
+        assert_eq!(results.last().unwrap().0, "EmcAnalysis");
+        assert!(matches!(results.last().unwrap().1, PhaseOutcome::Failed(_)));
+
+        // Every blocking violation is an antenna-length finding — one per routed track — and no
+        // other rule fired (the rest of the design is clean). Each names a routed track, the
+        // traceability anchor back through its net to intent.
+        let antenna: Vec<_> = core
+            .state
+            .violations
+            .iter()
+            .filter(|v| v.rule == "emc-antenna-length")
+            .collect();
+        assert!(!antenna.is_empty());
+        assert_eq!(antenna.len(), core.state.tracks.len());
+        assert!(antenna.iter().all(|v| v.is_blocking()));
+        assert_eq!(core.state.open_blocking_violations().len(), antenna.len());
+        for v in &antenna {
+            assert_eq!(v.subjects.len(), 1);
+            assert!(core.state.track(v.subjects[0]).is_some());
+        }
+
+        // Accept every antenna-length violation via the only write path — the Capability port (P2).
+        let vids: Vec<_> = antenna.iter().map(|v| v.id).collect();
+        for vid in vids {
+            let wid = core.fresh_id();
+            core.invoke(CapabilityRequest::GrantWaiver {
+                waiver: Waiver {
+                    id: wid,
+                    violation: vid,
+                    justification: "long traces accepted for prototype bring-up".into(),
+                    decided_by: "engineer".into(),
+                },
+            })
+            .expect("waiver granted");
+        }
+        assert!(core.state.open_blocking_violations().is_empty());
+
+        // Re-verify EMC: the long traces are still found, but the violations are waived, so no new
+        // violation is raised and nothing blocks — the phase now passes. (The tracks still exist,
+        // so re-verification genuinely re-runs the rule rather than passing on an empty board.)
+        assert!(!core.state.tracks.is_empty());
+        let raised_before = core.state.violations.len();
+        let mut emc = EmcAnalysisMachine::new();
+        let outcome = ExecutionEngine::new().run(&mut emc, &mut core);
+        assert_eq!(outcome, PhaseOutcome::Success);
+        assert_eq!(core.state.violations.len(), raised_before); // no duplicates raised
 
         // replay identity holds across the run + waive + re-verify.
         let replayed = replay(core.log()).unwrap();

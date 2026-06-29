@@ -1,19 +1,20 @@
-//! End-to-end verification of the Phase-3 exit criteria over the full 13-phase workflow:
+//! End-to-end verification of the Phase-3 exit criteria over the full 14-phase workflow:
 //! Requirement Planning -> Engineering Analysis -> Constraint Extraction -> Constraint
 //! Verification -> Schematic Planning -> ERC Verification -> BOM Planning -> BOM Verification
 //! -> PCB Floor Planning -> Component Placement -> Routing Planning -> DRC Verification -> DFM
-//! Verification. A consistent, realizable design runs all thirteen phases clean and lands a
-//! placed, routed, manufacturable board. Six kinds of fault are each caught at their gate,
-//! routed back automatically, and left fully traceable to their cause: an infeasible constraint
-//! pair (Constraint Verification), an electrically-invalid power net with consumers but no
-//! driver (ERC), a procurement fault — an end-of-life catalog part — at the BOM lifecycle gate,
-//! a courtyard that runs off an undersized board outline (DRC out-of-bounds), a trace finer than
-//! the fabrication process floor (DRC trace-width), and a component inside the board-edge
-//! keep-out (DFM edge-clearance). The first three faults stop the workflow before any of the PCB
-//! phases run; the DRC faults loop back to Routing Planning, and the DFM fault loops back to
-//! Component Placement. The Phase-1/2 guarantees (multi-phase orchestration, full requirement
-//! traceability, the correctness loops, byte-identical replay) still hold over the larger
-//! workflow.
+//! Verification -> EMC Analysis. A consistent, realizable design runs all fourteen phases clean
+//! and lands a placed, routed, manufacturable, electromagnetically-clean board. Seven kinds of
+//! fault are each caught at their gate, routed back automatically, and left fully traceable to
+//! their cause: an infeasible constraint pair (Constraint Verification), an electrically-invalid
+//! power net with consumers but no driver (ERC), a procurement fault — an end-of-life catalog
+//! part — at the BOM lifecycle gate, a courtyard that runs off an undersized board outline (DRC
+//! out-of-bounds), a trace finer than the fabrication process floor (DRC trace-width), a
+//! component inside the board-edge keep-out (DFM edge-clearance), and an electrically-long trace
+//! that radiates at the stated operating frequency (EMC antenna-length). The first three faults
+//! stop the workflow before any of the PCB phases run; the DRC and EMC faults loop back to
+//! Routing Planning, and the DFM fault loops back to Component Placement. The Phase-1/2 guarantees
+//! (multi-phase orchestration, full requirement traceability, the correctness loops, byte-identical
+//! replay) still hold over the larger workflow.
 
 use eak_cli::{
     replay_cmd, run, run_with, trace_cmd, PhaseOutcome, ReasoningChoice, Relation, RunConfig,
@@ -286,20 +287,69 @@ fn tight_edge_board_engine() -> Box<dyn ReasoningEngine> {
     }))
 }
 
+/// A reasoning engine for the EMC antenna-length scenario: a USB-C power-entry connector (a power
+/// source, so the rail is driven and ERC is clean), one electrical load, and a high-speed serial
+/// interface carrying a 10 GHz frequency target. With no Mechanical target the board defaults to a
+/// roomy 100 mm square, so the placement geometry, DRC, and DFM are all clean; but Routing Planning
+/// realizes every net as a centroid-to-centroid track tens of millimetres long — far longer than
+/// the electrically-long limit (lambda/10 = 3 mm at 10 GHz) — so EMC Analysis flags each routed
+/// track as a radiator. It is the one fault produced at the EMC gate rather than at any earlier
+/// gate, and it loops back to Routing Planning.
+fn high_speed_engine() -> Box<dyn ReasoningEngine> {
+    let usb_c = CandidateRequirement {
+        statement: "Device shall be powered over USB-C".into(),
+        category: RequirementCategory::Functional,
+        priority: Priority::High,
+        acceptance_criterion: "the device draws power through a USB-C receptacle".into(),
+        source_hint: "intent: USB-C power entry".into(),
+        confidence: 0.9,
+        rationale: "USB-C is the stated power interface".into(),
+        targets: vec![],
+    };
+    let load = CandidateRequirement {
+        statement: "Logic core shall operate at a 3.3 V logic level".into(),
+        category: RequirementCategory::Electrical,
+        priority: Priority::High,
+        acceptance_criterion: "core I/O is measured at a 3.3 V logic level".into(),
+        source_hint: "intent: logic core".into(),
+        confidence: 0.9,
+        rationale: "the digital core needs a defined logic level".into(),
+        targets: vec![],
+    };
+    let high_speed = CandidateRequirement {
+        statement: "High-speed serial link shall operate at 10 GHz".into(),
+        category: RequirementCategory::Electrical,
+        priority: Priority::High,
+        acceptance_criterion: "radiated emissions are assessed at the 10 GHz line rate".into(),
+        source_hint: "intent: high-speed link".into(),
+        confidence: 0.9,
+        rationale: "the multi-gigabit serial line sets the emission spectrum".into(),
+        targets: vec![PhysicalQuantity::new(10_000.0, Unit::Megahertz)],
+    };
+    Box::new(FixtureEngine::single(ReasoningResponse {
+        candidates: vec![usb_c, load, high_speed],
+        clarifying_questions: vec![],
+        raw: "{}".into(),
+    }))
+}
+
 #[test]
-fn run_replays_byte_identical_and_runs_thirteen_phases() {
+fn run_replays_byte_identical_and_runs_fourteen_phases() {
     let (config, log) = cfg("det", 1);
     let report = run(&config).expect("run succeeds");
 
     // Full Phase-3 workflow on a consistent, realizable design: RP -> Engineering Analysis ->
     // Constraint Extraction -> Constraint Verification -> Schematic Planning -> ERC -> BOM
     // Planning -> BOM Verification -> PCB Floor Planning -> Component Placement -> Routing
-    // Planning -> DRC -> DFM, all OK.
-    assert_eq!(report.outcomes.len(), 13);
+    // Planning -> DRC -> DFM -> EMC, all OK.
+    assert_eq!(report.outcomes.len(), 14);
     assert!(report
         .outcomes
         .iter()
         .all(|(_, o)| matches!(o, PhaseOutcome::Success)));
+    // The last phase is the EMC gate, and it passed (the default intent states no operating
+    // frequency, so the antenna-length analysis is silent).
+    assert_eq!(report.outcomes.last().unwrap().0, "EmcAnalysis");
 
     // Three requirements; two carry targets, so two constraints; no violations.
     assert_eq!(report.state.requirements.len(), 3);
@@ -995,6 +1045,149 @@ fn dfm_edge_too_close_is_caught_routed_back_and_left_traceable() {
 }
 
 #[test]
+fn emc_antenna_trace_is_caught_routed_back_and_left_traceable() {
+    let (config, log) = cfg("emc", 17);
+    let report = run_with(high_speed_engine(), &config).expect("run completes with a failure");
+
+    // The EMC correctness loop fired: EMC Analysis failed and was routed back to Routing Planning
+    // (the canonical target — emissions/coupling are routing-dominated), bounded to 1 initial + 2
+    // retries = 3 EMC runs, every one failing.
+    let emc_runs: Vec<&PhaseOutcome> = report
+        .outcomes
+        .iter()
+        .filter(|(n, _)| n == "EmcAnalysis")
+        .map(|(_, o)| o)
+        .collect();
+    assert_eq!(emc_runs.len(), 3);
+    assert!(emc_runs
+        .iter()
+        .all(|o| matches!(o, PhaseOutcome::Failed(_))));
+
+    // Routing Planning re-ran on each loop-back (idempotent): 1 initial + 2 re-entries.
+    let routing_runs = report
+        .outcomes
+        .iter()
+        .filter(|(n, _)| n == "RoutingPlanning")
+        .count();
+    assert_eq!(routing_runs, 3);
+
+    // DRC and DFM ran clean upstream on every pass — the layout fits, the traces are wide enough
+    // and clear of the edge. Per-phase gating means the open EMC violations never fail DRC or DFM
+    // when they re-run on the loop-back; EMC is the only gate that fails.
+    assert!(report
+        .outcomes
+        .iter()
+        .filter(|(n, _)| n == "DrcVerification")
+        .all(|(_, o)| matches!(o, PhaseOutcome::Success)));
+    assert!(report
+        .outcomes
+        .iter()
+        .filter(|(n, _)| n == "DfmVerification")
+        .all(|(_, o)| matches!(o, PhaseOutcome::Success)));
+
+    // The board was placed and routed clean upstream — the substrate EMC is analyzed against
+    // exists: an outline and one track per net.
+    assert!(report.state.board.is_some());
+    assert!(!report.state.tracks.is_empty());
+    assert_eq!(report.state.tracks.len(), report.state.nets.len());
+
+    // The workflow did not reach a clean end: its final phase is the failed EMC gate.
+    let (last_name, last_outcome) = report.outcomes.last().expect("at least one phase ran");
+    assert_eq!(last_name, "EmcAnalysis");
+    assert!(matches!(last_outcome, PhaseOutcome::Failed(_)));
+
+    // The only blocking violations are antenna-length findings — one per routed track — each OPEN,
+    // Error-severity, and never double-raised across the loop-back re-verifications.
+    let antenna: Vec<_> = report
+        .state
+        .violations
+        .iter()
+        .filter(|v| v.rule == "emc-antenna-length")
+        .collect();
+    assert!(!antenna.is_empty());
+    assert_eq!(antenna.len(), report.state.tracks.len());
+    assert_eq!(
+        report.state.open_blocking_violations().len(),
+        antenna.len(),
+        "the electrically-long traces are the only blocking violations"
+    );
+    for v in &antenna {
+        assert_eq!(v.status, ViolationStatus::Open);
+        assert_eq!(v.severity, ViolationSeverity::Error);
+        assert!(v.is_blocking());
+    }
+
+    // FULLY TRACEABLE across the routing layer: the violation names a track; walk
+    // track -> net -> member pins -> component -> functional block -> requirement -> design intent,
+    // checking the backing provenance link at each synthesized hop.
+    let intent = report.state.intent.as_ref().expect("intent captured");
+    let v = antenna[0];
+    assert_eq!(
+        v.subjects.len(),
+        1,
+        "one electrically-long trace implicated"
+    );
+    let tid = v.subjects[0];
+
+    // Violation -> Track (TracesTo), raised by EMC Analysis.
+    assert!(report
+        .state
+        .links
+        .iter()
+        .any(|l| l.from == v.id && l.to == tid && l.relation == Relation::TracesTo));
+
+    let track = report
+        .state
+        .track(tid)
+        .expect("violation subject is a known track");
+
+    // Track -> Net (TracesTo), recorded by Routing Planning.
+    assert!(report
+        .state
+        .links
+        .iter()
+        .any(|l| l.from == tid && l.to == track.net && l.relation == Relation::TracesTo));
+
+    let net = report
+        .state
+        .net(track.net)
+        .expect("track realizes a known net");
+    assert!(!net.members.is_empty(), "the routed net joins pins");
+    for pin_id in &net.members {
+        let pin = report
+            .state
+            .pin(*pin_id)
+            .expect("net member is a known pin");
+        let component = report
+            .state
+            .component(pin.component)
+            .expect("pin belongs to a known component");
+        let block = report
+            .state
+            .functional_block(component.from_block)
+            .expect("component was realized from a known block");
+        assert!(
+            !block.requirements.is_empty(),
+            "block realizes a requirement"
+        );
+        for req_id in &block.requirements {
+            let req = report
+                .state
+                .requirement(*req_id)
+                .expect("block realizes a known requirement");
+            assert_eq!(req.source, intent.id);
+        }
+    }
+
+    // Replay identity holds even for a failed, looped-back EMC run.
+    let replayed = replay_cmd(&log).expect("replay succeeds");
+    assert_eq!(report.state, replayed);
+    assert_eq!(report.state.canonical_json(), replayed.canonical_json());
+
+    let _ = std::fs::remove_file(&log);
+}
+
+#[test]
 fn every_requirement_is_fully_traceable() {
     let (config, log) = cfg("trace", 2);
     let report = run(&config).expect("run succeeds");
@@ -1031,7 +1224,7 @@ fn two_runs_with_same_seed_are_identical() {
     let (c2, l2) = cfg("rep2", 7);
     let r1 = run(&c1).expect("run 1");
     let r2 = run(&c2).expect("run 2");
-    // determinism of the run itself (seeded ids + logical clock) across the 12-phase workflow.
+    // determinism of the run itself (seeded ids + logical clock) across the 14-phase workflow.
     assert_eq!(r1.state, r2.state);
     let _ = std::fs::remove_file(&l1);
     let _ = std::fs::remove_file(&l2);
