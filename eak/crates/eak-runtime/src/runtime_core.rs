@@ -494,11 +494,11 @@ impl RuntimeCore {
                 "cannot route a net before the board outline exists".into(),
             ));
         }
-        // Single-realization: a net is realized by exactly one track, so a second track for the
-        // same net would contradict net-realization completeness — reject it (P5).
-        if self.state.tracks.iter().any(|t| t.net == track.net) {
-            return Err(CapabilityError::Rejected("net is already routed".into()));
-        }
+        // A net is realized by a DAISY-CHAIN of one or more tracks (one segment per consecutive
+        // member pad), so the seam does NOT cap the track count per net — that would reject the
+        // chain's later segments. Idempotency is the Routing Planning machine's own concern: it
+        // skips any net already realized by ≥1 track on re-entry, so a DRC loop-back never
+        // re-mints (each segment still carries a fresh, unique id, so replay stays exact — P4).
 
         let mut events = vec![Event::TrackCommitted { track }];
         for link in links {

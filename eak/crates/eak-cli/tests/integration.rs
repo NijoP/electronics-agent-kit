@@ -381,9 +381,15 @@ fn run_replays_byte_identical_and_runs_fifteen_phases() {
     assert!(report.state.board.is_some());
     assert!(!report.state.placements.is_empty());
 
-    // The routing layer landed: every net was realized by exactly one track.
+    // The routing layer landed: every net is realized by copper (a daisy-chain of one or more
+    // segments), so there is at least one track per net.
     assert!(!report.state.tracks.is_empty());
-    assert_eq!(report.state.tracks.len(), report.state.nets.len());
+    assert!(report
+        .state
+        .nets
+        .iter()
+        .all(|n| report.state.tracks.iter().any(|t| t.net == n.id)));
+    assert!(report.state.tracks.len() >= report.state.nets.len());
 
     // EXIT CRITERION (Phase 1, preserved): history replays to identical state, byte for byte.
     let replayed = replay_cmd(&log).expect("replay succeeds");
@@ -837,11 +843,17 @@ fn routing_trace_too_fine_is_caught_routed_back_and_left_traceable() {
         .count();
     assert_eq!(routing_runs, 3);
 
-    // The board was placed and routed clean upstream — the substrate DRC is checked against
-    // exists: an outline and one track per net.
+    // The board was placed and routed clean upstream — the substrate the DRC is checked against
+    // exists: an outline and a daisy-chain of segments realizing every net (at least one track
+    // per net).
     assert!(report.state.board.is_some());
     assert!(!report.state.tracks.is_empty());
-    assert_eq!(report.state.tracks.len(), report.state.nets.len());
+    assert!(report
+        .state
+        .nets
+        .iter()
+        .all(|n| report.state.tracks.iter().any(|t| t.net == n.id)));
+    assert!(report.state.tracks.len() >= report.state.nets.len());
 
     // The workflow did not reach a clean end: its final phase is the failed DRC gate.
     let (last_name, last_outcome) = report.outcomes.last().expect("at least one phase ran");
@@ -1097,11 +1109,17 @@ fn emc_antenna_trace_is_caught_routed_back_and_left_traceable() {
         .filter(|(n, _)| n == "DfmVerification")
         .all(|(_, o)| matches!(o, PhaseOutcome::Success)));
 
-    // The board was placed and routed clean upstream — the substrate EMC is analyzed against
-    // exists: an outline and one track per net.
+    // The board was placed and routed clean upstream — the substrate the EMC is analyzed against
+    // exists: an outline and a daisy-chain of segments realizing every net (at least one track
+    // per net).
     assert!(report.state.board.is_some());
     assert!(!report.state.tracks.is_empty());
-    assert_eq!(report.state.tracks.len(), report.state.nets.len());
+    assert!(report
+        .state
+        .nets
+        .iter()
+        .all(|n| report.state.tracks.iter().any(|t| t.net == n.id)));
+    assert!(report.state.tracks.len() >= report.state.nets.len());
 
     // The workflow did not reach a clean end: its final phase is the failed EMC gate.
     let (last_name, last_outcome) = report.outcomes.last().expect("at least one phase ran");

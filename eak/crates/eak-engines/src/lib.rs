@@ -12,6 +12,7 @@ use eak_domain::{
 };
 use eak_units::{Dimension, PhysicalQuantity, UnitError};
 use std::cmp::Ordering;
+use std::collections::BTreeSet;
 
 /// One step in an agent's elicitation reasoning-plan.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -723,11 +724,14 @@ impl Rule for DrcTraceWidthRule {
 
 /// DRC rule: every committed [`Net`] must be realized by at least one routed [`Track`]. An
 /// unrouted net carries no copper, so the nodes it joins are not actually connected on the board
-/// — an electrical break. Routing Planning realizes one track per net, so in a complete layout
-/// this rule is silent; it is the downstream check that makes net-realization *completeness* a
-/// first-class, traceable [`Violation`](eak_domain::Violation) rather than resting solely on the
-/// upstream "every component is placed" invariant (a regression guard, since DRC runs only after
-/// Routing). A flagged net implicates itself (`Violation -> Net -> ... -> Requirement -> Intent`).
+/// — an electrical break. Routing Planning realizes at least one track per net (a daisy-chain of
+/// segments over its member pads), so in a complete layout this rule is silent; it is the
+/// downstream check that makes net-realization *completeness* a first-class, traceable
+/// [`Violation`](eak_domain::Violation) rather than resting solely on the upstream "every
+/// component is placed" invariant (a regression guard, since DRC runs only after Routing). This
+/// rule checks only that a net carries *some* copper; that the copper actually *joins* every pad
+/// is [`DrcNetOpenRule`]'s concern. A flagged net implicates itself
+/// (`Violation -> Net -> ... -> Requirement -> Intent`).
 /// Nets are scanned in slice order for determinism.
 pub struct DrcUnroutedNetRule;
 
@@ -762,6 +766,179 @@ impl Rule for DrcUnroutedNetRule {
                         "net \"{}\" ({}) is not realized by any routed track",
                         net.name,
                         net.id.short()
+                    ),
+                });
+            }
+        }
+        findings
+    }
+}
+
+/// The SI tolerance (in metres, ~1 nm) for matching a track endpoint to a placement centroid. The
+/// router mints each endpoint AT a member's courtyard centroid, but through a millimetre
+/// round-trip (`(si * 1000) mm`, read back via `si_magnitude`), so an epsilon match decouples the
+/// connectivity check from exact float reproduction while staying deterministic — the same
+/// tolerance shape the trace-width and antenna-length rules use.
+const CENTROID_MATCH_EPS_SI: f64 = 1e-9;
+
+/// A placement's courtyard centroid on the SI axis, as `(x, y)` in metres: origin + half extent,
+/// the very point the router routes a segment endpoint to.
+fn placement_centroid_si(p: &Placement) -> (f64, f64) {
+    (
+        p.x.si_magnitude() + p.width.si_magnitude() / 2.0,
+        p.y.si_magnitude() + p.height.si_magnitude() / 2.0,
+    )
+}
+
+/// Resolve a track endpoint (SI coordinates) to the index of the `nodes` placement whose courtyard
+/// centroid it matches within [`CENTROID_MATCH_EPS_SI`], or `None` if it matches none. Scans
+/// `nodes` in order, so the result is deterministic.
+fn endpoint_node(px: f64, py: f64, nodes: &[&Placement]) -> Option<usize> {
+    nodes.iter().position(|p| {
+        let (cx, cy) = placement_centroid_si(p);
+        (cx - px).abs() <= CENTROID_MATCH_EPS_SI && (cy - py).abs() <= CENTROID_MATCH_EPS_SI
+    })
+}
+
+/// A minimal disjoint-set (union-find) over a fixed node set, indexed `0..n`. Used by
+/// [`DrcNetOpenRule`] to coalesce a net's member placements joined by its tracks; the number of
+/// distinct roots that remain is the count of disconnected copper components. Deterministic:
+/// `find`/`union` depend only on the union order, which is the net's slice-ordered tracks.
+struct DisjointSet {
+    parent: Vec<usize>,
+}
+
+impl DisjointSet {
+    fn new(n: usize) -> Self {
+        Self {
+            parent: (0..n).collect(),
+        }
+    }
+
+    fn find(&mut self, mut x: usize) -> usize {
+        while self.parent[x] != x {
+            self.parent[x] = self.parent[self.parent[x]]; // path halving
+            x = self.parent[x];
+        }
+        x
+    }
+
+    fn union(&mut self, a: usize, b: usize) {
+        let (ra, rb) = (self.find(a), self.find(b));
+        if ra != rb {
+            self.parent[ra] = rb;
+        }
+    }
+
+    /// The number of distinct sets (connected components) over the `0..n` nodes.
+    fn component_count(&mut self) -> usize {
+        let n = self.parent.len();
+        let mut roots: BTreeSet<usize> = BTreeSet::new();
+        for i in 0..n {
+            let r = self.find(i);
+            roots.insert(r);
+        }
+        roots.len()
+    }
+}
+
+/// DRC rule: every committed [`Net`] whose pads span more than one placement must be electrically
+/// *connected* by its copper — all member pads must fall in a single connected component of the
+/// net's tracks. This is the dual of [`DrcUnroutedNetRule`]: that rule asks whether a net carries
+/// *any* copper; this asks whether the copper actually *joins* the pads. A net whose tracks leave
+/// a member pad in its own island is electrically OPEN — a hard break — so it is a blocking Error.
+///
+/// ALGORITHM (per net, scanned in slice order for determinism): the NODES are the distinct
+/// placements hosting the net's member pins (a member pin -> its component -> that component's
+/// placement), collected in a [`BTreeSet`] so the node order is reproducible. The EDGES are the
+/// net's own tracks; each track endpoint is resolved to the node placement whose courtyard
+/// centroid it matches (within [`CENTROID_MATCH_EPS_SI`] — the router mints endpoints at those
+/// centroids) and the two matched nodes are unioned in a [`DisjointSet`]. The net is open when its
+/// member placements span more than one set once all its tracks are folded in. A net with fewer
+/// than two distinct placements is trivially connected (skipped), and a net with NO track is left
+/// to [`DrcUnroutedNetRule`] (skipped here) so the two rules never double-flag the same break.
+///
+/// SCOPE: this detects OPENS only, not SHORTS. In this data model a [`Track`] carries only a net
+/// id and endpoints (no pad refs) and a single placement hosts pins from several nets (a connector
+/// sits on both VBUS and GND), so a global placement-node graph would report a false short on
+/// every multi-net component. Copper-to-copper SHORT detection is a separate, geometric concern
+/// (the copper-clearance rule), not this rule's.
+pub struct DrcNetOpenRule;
+
+impl DrcNetOpenRule {
+    pub const ID: &'static str = "drc-net-open";
+
+    pub fn new() -> Self {
+        Self
+    }
+}
+impl Default for DrcNetOpenRule {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Rule for DrcNetOpenRule {
+    fn id(&self) -> &str {
+        Self::ID
+    }
+
+    fn evaluate(&self, ctx: &VerificationContext) -> Vec<ViolationFinding> {
+        let mut findings = Vec::new();
+        for net in ctx.nets.iter() {
+            // NODES: the distinct placements hosting this net's member pins, in a deterministic
+            // (sorted) order. A dangling member pin or unplaced component contributes no node —
+            // those gaps are caught at their own seams/rules, not here.
+            let mut node_ids: BTreeSet<EntityId> = BTreeSet::new();
+            for pin_id in &net.members {
+                let Some(pin) = ctx.pins.iter().find(|p| p.id == *pin_id) else {
+                    continue;
+                };
+                if let Some(pl) = ctx
+                    .placements
+                    .iter()
+                    .find(|pl| pl.component == pin.component)
+                {
+                    node_ids.insert(pl.id);
+                }
+            }
+            // Fewer than two distinct placements: the net cannot be open (it has at most one pad).
+            if node_ids.len() < 2 {
+                continue;
+            }
+            let nodes: Vec<&Placement> = node_ids
+                .iter()
+                .filter_map(|id| ctx.placements.iter().find(|p| p.id == *id))
+                .collect();
+
+            // EDGES: this net's tracks. A net with no copper at all is left to
+            // DrcUnroutedNetRule so the two rules never double-flag the same break.
+            let net_tracks: Vec<&Track> = ctx.tracks.iter().filter(|t| t.net == net.id).collect();
+            if net_tracks.is_empty() {
+                continue;
+            }
+
+            // Union the node placements joined by each track segment.
+            let mut dsu = DisjointSet::new(nodes.len());
+            for t in &net_tracks {
+                let a = endpoint_node(t.x1.si_magnitude(), t.y1.si_magnitude(), &nodes);
+                let b = endpoint_node(t.x2.si_magnitude(), t.y2.si_magnitude(), &nodes);
+                if let (Some(a), Some(b)) = (a, b) {
+                    dsu.union(a, b);
+                }
+            }
+
+            let components = dsu.component_count();
+            if components > 1 {
+                findings.push(ViolationFinding {
+                    rule: Self::ID.to_string(),
+                    severity: ViolationSeverity::Error,
+                    subjects: vec![net.id],
+                    message: format!(
+                        "net \"{}\" ({}) is electrically open: member pads fall in {} disconnected copper components",
+                        net.name,
+                        net.id.short(),
+                        components
                     ),
                 });
             }
@@ -1634,6 +1811,119 @@ mod tests {
         // Nothing to realize: a design with no nets has no unrouted nets.
         assert!(DrcUnroutedNetRule::new()
             .evaluate(&unrouted_ctx(&[], &[]))
+            .is_empty());
+    }
+
+    // ------------------------------ net-open rule tests ------------------------------
+
+    /// A track segment of a specific net spanning two arbitrary endpoints (mm). The open rule
+    /// resolves each endpoint to a placement centroid, so its coordinates carry the topology.
+    #[allow(clippy::too_many_arguments)]
+    fn seg(id: u128, net_id: u128, x1: f64, y1: f64, x2: f64, y2: f64) -> Track {
+        Track {
+            id: EntityId(id),
+            net: EntityId(net_id),
+            layer: BoardSide::Top,
+            width: mm(0.25),
+            x1: mm(x1),
+            y1: mm(y1),
+            x2: mm(x2),
+            y2: mm(y2),
+        }
+    }
+
+    fn open_ctx<'a>(
+        pins: &'a [Pin],
+        nets: &'a [Net],
+        placements: &'a [Placement],
+        tracks: &'a [Track],
+    ) -> VerificationContext<'a> {
+        VerificationContext {
+            requirements: &[],
+            constraints: &[],
+            components: &[],
+            pins,
+            nets,
+            parts: &[],
+            bom_line_items: &[],
+            board: None,
+            placements,
+            tracks,
+        }
+    }
+
+    /// The three-pad fixture shared by the open-rule tests: pins 1/2/3 sit on components
+    /// 901/902/903 (the `pin` helper's `900 + id` convention), placed left-to-right with
+    /// centroids at (5,5), (25,5), (45,5) mm. Net 50 joins all three pins.
+    fn three_pad_net() -> (Vec<Pin>, Vec<Net>, Vec<Placement>) {
+        let pins = vec![
+            pin(1, PinElectricalType::Passive),
+            pin(2, PinElectricalType::Passive),
+            pin(3, PinElectricalType::Passive),
+        ];
+        let nets = vec![net(50, NetClass::Signal, vec![1, 2, 3])];
+        let placements = vec![
+            placement(10, 901, 0.0, 0.0, 10.0, 10.0, BoardSide::Top),
+            placement(11, 902, 20.0, 0.0, 10.0, 10.0, BoardSide::Top),
+            placement(12, 903, 40.0, 0.0, 10.0, 10.0, BoardSide::Top),
+        ];
+        (pins, nets, placements)
+    }
+
+    #[test]
+    fn daisy_chained_net_is_connected() {
+        // The happy-path topology: two consecutive segments (pA-pB, pB-pC) coalesce all three
+        // pads into one copper component, so the net is connected — no finding.
+        let (pins, nets, placements) = three_pad_net();
+        let tracks = vec![
+            seg(100, 50, 5.0, 5.0, 25.0, 5.0),
+            seg(101, 50, 25.0, 5.0, 45.0, 5.0),
+        ];
+        assert!(DrcNetOpenRule::new()
+            .evaluate(&open_ctx(&pins, &nets, &placements, &tracks))
+            .is_empty());
+    }
+
+    #[test]
+    fn net_with_isolated_interior_pad_is_open() {
+        // A single first->last segment (pA-pC) leaves the interior pad pB in its own island:
+        // the member pads fall in two components, so the net is electrically open.
+        let (pins, nets, placements) = three_pad_net();
+        let tracks = vec![seg(100, 50, 5.0, 5.0, 45.0, 5.0)];
+        let findings =
+            DrcNetOpenRule::new().evaluate(&open_ctx(&pins, &nets, &placements, &tracks));
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule, DrcNetOpenRule::ID);
+        assert_eq!(findings[0].severity, ViolationSeverity::Error);
+        assert_eq!(findings[0].subjects, vec![EntityId(50)]);
+    }
+
+    #[test]
+    fn net_with_no_track_is_deferred_to_unrouted_rule() {
+        // No copper at all: leave it to DrcUnroutedNetRule rather than double-flag the break.
+        let (pins, nets, placements) = three_pad_net();
+        assert!(DrcNetOpenRule::new()
+            .evaluate(&open_ctx(&pins, &nets, &placements, &[]))
+            .is_empty());
+    }
+
+    #[test]
+    fn single_placement_net_is_trivially_connected() {
+        // Two pins on ONE component (one placement) span no gap, so the net cannot be open even
+        // with a single degenerate self-track — guards against a false positive on intra-part nets.
+        // Both pins resolve to component 901 (pin 2 is forced onto it from its default 902).
+        let pins = [
+            pin(1, PinElectricalType::Passive),
+            Pin {
+                component: EntityId(901),
+                ..pin(2, PinElectricalType::Passive)
+            },
+        ];
+        let nets = vec![net(50, NetClass::Signal, vec![1, 2])];
+        let placements = vec![placement(10, 901, 0.0, 0.0, 10.0, 10.0, BoardSide::Top)];
+        let tracks = vec![seg(100, 50, 5.0, 5.0, 5.0, 5.0)];
+        assert!(DrcNetOpenRule::new()
+            .evaluate(&open_ctx(&pins, &nets, &placements, &tracks))
             .is_empty());
     }
 

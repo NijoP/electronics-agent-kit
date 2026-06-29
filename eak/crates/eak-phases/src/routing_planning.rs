@@ -1,11 +1,13 @@
 //! Routing Planning state machine (instance) — DETERMINISTIC in Phase 3.
 //!
-//! It realizes each committed [`Net`](eak_domain::Net) physically as one
-//! [`Track`](eak_domain::Track) of copper on the board, then **enriches** the [`PcbIr`] (P6)
-//! with those tracks. It makes NO reasoning calls: a net's track spans its member components'
-//! placements (a pure function of the committed layout) and carries a fixed default trace
+//! It realizes each committed [`Net`](eak_domain::Net) physically as a **daisy-chain** of
+//! [`Track`](eak_domain::Track) segments over its consecutive member placements — one segment per
+//! adjacent pair, so a k-pad net carries k-1 segments and every member pad lands on copper (a
+//! single-pad net gets one degenerate self-track) — then **enriches** the [`PcbIr`] (P6) with
+//! those tracks. It makes NO reasoning calls: a net's segments span its member components'
+//! placements (a pure function of the committed layout) and carry a fixed default trace
 //! width, so a replay is bit-identical (P4). It is idempotent: it routes only the nets not yet
-//! realized by a track, so a re-entry (a DRC loop-back) mints exactly the missing tracks — ids
+//! realized by a track, so a re-entry (a DRC loop-back) mints exactly the missing chains — ids
 //! and geometry stay reproducible — and a fully-routed re-entry commits nothing new. See
 //! `docs/state-machines/routing-planning.md`.
 
@@ -118,50 +120,61 @@ impl Machine for RoutingPlanningMachine {
                         continue;
                     }
 
-                    // Order endpoints by centre x (then id) so the segment is deterministic
-                    // regardless of net-member order; the track runs from the first member's
-                    // centroid to the last's. `total_cmp` is a total order (no NaN masking — a
-                    // non-finite coordinate would be rejected at the track seam, not silently
+                    // Order members by centre x (then id) so the daisy-chain is deterministic
+                    // regardless of net-member order. `total_cmp` is a total order (no NaN masking
+                    // — a non-finite coordinate would be rejected at the track seam, not silently
                     // sorted as equal).
                     members.sort_by(|a, b| {
                         center_mm(a.x, a.width)
                             .total_cmp(&center_mm(b.x, b.width))
                             .then(a.id.cmp(&b.id))
                     });
-                    let first = members.first().expect("members is non-empty");
-                    let last = members.last().expect("members is non-empty");
 
-                    let tid = ctx.fresh_id();
-                    let track = Track {
-                        id: tid,
-                        net: net.id,
-                        layer: BoardSide::Top,
-                        width: PhysicalQuantity::new(class_width_mm(net.class), Unit::Millimetre),
-                        x1: PhysicalQuantity::new(
-                            center_mm(first.x, first.width),
-                            Unit::Millimetre,
-                        ),
-                        y1: PhysicalQuantity::new(
-                            center_mm(first.y, first.height),
-                            Unit::Millimetre,
-                        ),
-                        x2: PhysicalQuantity::new(center_mm(last.x, last.width), Unit::Millimetre),
-                        y2: PhysicalQuantity::new(center_mm(last.y, last.height), Unit::Millimetre),
-                    };
-                    // Provenance: the track traces to the net it realizes (P3), so a trace-width
-                    // DRC violation is link-traceable back through the net to intent:
-                    // Violation -> Track -> Net -> ... -> Requirement -> Intent.
-                    let link = ProvenanceLink {
-                        id: ctx.fresh_id(),
-                        from: tid,
-                        to: net.id,
-                        relation: RelationType::TracesTo,
-                    };
-                    ctx.invoke(CapabilityRequest::RouteNet {
-                        track,
-                        links: vec![link],
-                    })
-                    .map_err(|e| MachineError::Internal(e.to_string()))?;
+                    // Realize the net as a daisy-chain: one Track per consecutive member pair, so a
+                    // k-pad net carries k-1 segments and EVERY member pad lands on copper — the
+                    // precondition the open-detection DRC rule (`drc-net-open`) checks. A single-pad
+                    // net yields one degenerate self-track so it is still realized
+                    // (`DrcUnroutedNetRule` stays silent) and is trivially connected. Each segment
+                    // takes its own `fresh_id` in member order, so a replay is bit-identical (P4);
+                    // all k-1 mint in one pass before `Done`, and the `routed.contains` guard above
+                    // skips an already-realized net on re-entry, so a DRC loop-back never
+                    // double-mints (idempotent).
+                    for (from, to) in daisy_chain_segments(&members) {
+                        let tid = ctx.fresh_id();
+                        let track = Track {
+                            id: tid,
+                            net: net.id,
+                            layer: BoardSide::Top,
+                            width: PhysicalQuantity::new(
+                                class_width_mm(net.class),
+                                Unit::Millimetre,
+                            ),
+                            x1: PhysicalQuantity::new(
+                                center_mm(from.x, from.width),
+                                Unit::Millimetre,
+                            ),
+                            y1: PhysicalQuantity::new(
+                                center_mm(from.y, from.height),
+                                Unit::Millimetre,
+                            ),
+                            x2: PhysicalQuantity::new(center_mm(to.x, to.width), Unit::Millimetre),
+                            y2: PhysicalQuantity::new(center_mm(to.y, to.height), Unit::Millimetre),
+                        };
+                        // Provenance: each segment traces to the net it realizes (P3), so a
+                        // trace-width DRC violation is link-traceable back through the net to
+                        // intent: Violation -> Track -> Net -> ... -> Requirement -> Intent.
+                        let link = ProvenanceLink {
+                            id: ctx.fresh_id(),
+                            from: tid,
+                            to: net.id,
+                            relation: RelationType::TracesTo,
+                        };
+                        ctx.invoke(CapabilityRequest::RouteNet {
+                            track,
+                            links: vec![link],
+                        })
+                        .map_err(|e| MachineError::Internal(e.to_string()))?;
+                    }
                 }
 
                 // Re-project the PCB IR enriched with the tracks (P6) and record the boundary
@@ -185,6 +198,20 @@ impl Machine for RoutingPlanningMachine {
 /// unit the placement happens to carry (P9).
 fn center_mm(origin: PhysicalQuantity, extent: PhysicalQuantity) -> f64 {
     (origin.si_magnitude() + extent.si_magnitude() / 2.0) * 1000.0
+}
+
+/// The daisy-chain of copper segments realizing a net over its ordered member placements: one
+/// `(from, to)` segment per consecutive pair, so a `k`-pad net yields `k - 1` segments and every
+/// member pad lands on a segment endpoint. A single-pad net yields one degenerate `(only, only)`
+/// self-track so the net is still realized (`DrcUnroutedNetRule` stays silent) and is trivially
+/// connected. Track count is therefore `max(k - 1, 1)`. Pure and order-preserving, so the minted
+/// ids and geometry replay identically (P4).
+fn daisy_chain_segments<'a>(members: &[&'a Placement]) -> Vec<(&'a Placement, &'a Placement)> {
+    match members {
+        [] => Vec::new(),
+        [only] => vec![(*only, *only)],
+        _ => members.windows(2).map(|w| (w[0], w[1])).collect(),
+    }
 }
 
 /// Project canonical state into the [`PcbIr`] enriched with tracks, through the full lowering
@@ -238,5 +265,44 @@ mod tests {
             let w = class_width_mm(c);
             assert!(w.is_finite() && w > 0.0);
         }
+    }
+
+    /// A minimal placement at the given centre-x (the only axis the daisy-chain orders on here).
+    fn pl(id: u128, x: f64) -> Placement {
+        Placement {
+            id: EntityId(id),
+            component: EntityId(900 + id),
+            x: PhysicalQuantity::new(x, Unit::Millimetre),
+            y: PhysicalQuantity::new(0.0, Unit::Millimetre),
+            width: PhysicalQuantity::new(2.0, Unit::Millimetre),
+            height: PhysicalQuantity::new(2.0, Unit::Millimetre),
+            side: BoardSide::Top,
+        }
+    }
+
+    #[test]
+    fn daisy_chain_segment_count_is_max_k_minus_one_and_one() {
+        let (p0, p1, p2) = (pl(1, 0.0), pl(2, 10.0), pl(3, 20.0));
+        // k = 1: a single-pad net still yields one (degenerate) self-track, so it is realized.
+        assert_eq!(daisy_chain_segments(&[&p0]).len(), 1);
+        // k = 2: a single spanning segment.
+        assert_eq!(daisy_chain_segments(&[&p0, &p1]).len(), 1);
+        // k = 3: two consecutive segments — the topology that lets the open-detection rule see
+        // every interior pad land on copper.
+        let segs = daisy_chain_segments(&[&p0, &p1, &p2]);
+        assert_eq!(segs.len(), 2);
+        // Segments run over consecutive members: (p0, p1) then (p1, p2).
+        assert_eq!((segs[0].0.id, segs[0].1.id), (p0.id, p1.id));
+        assert_eq!((segs[1].0.id, segs[1].1.id), (p1.id, p2.id));
+    }
+
+    #[test]
+    fn single_pad_segment_is_degenerate() {
+        // The lone self-track runs from the pad's centroid to itself (first == last), keeping the
+        // net trivially connected for the open-detection rule.
+        let p0 = pl(1, 5.0);
+        let segs = daisy_chain_segments(&[&p0]);
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].0.id, segs[0].1.id);
     }
 }

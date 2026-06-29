@@ -115,8 +115,9 @@ pub enum CapabilityRequest {
     },
     /// Route one [`Net`] as a copper [`Track`], with its provenance links (Phase 3 routing).
     /// The runtime re-validates the trace (positive width, finite endpoints), checks the net
-    /// exists, requires the board to exist first, and rejects a second track for the same net
-    /// at the seam — a net is realized by exactly one track.
+    /// exists, and requires the board to exist first. A net is realized by a DAISY-CHAIN of one
+    /// or more tracks (one segment per consecutive member pad), so the seam permits several
+    /// tracks per net; idempotency is the Routing Planning machine's concern, not the seam's.
     RouteNet {
         track: Track,
         links: Vec<ProvenanceLink>,

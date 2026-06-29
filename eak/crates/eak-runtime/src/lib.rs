@@ -775,8 +775,9 @@ mod kernel_tests {
     }
 
     /// The routing seam mirrors the placement seam: a track is rejected before any board
-    /// exists, when it realizes an unknown net, and on a second route of an already-routed net;
-    /// a well-formed track for a committed net on a committed board commits exactly once.
+    /// exists and when it realizes an unknown net. A net is realized by a daisy-chain, so a
+    /// well-formed track for a committed net on a committed board commits — and a second
+    /// segment for the same net is accepted too (the seam no longer caps the per-net count).
     #[test]
     fn phase3_routing_handler_rejects_untraceable_proposals_at_the_seam() {
         let mut core = new_core();
@@ -888,15 +889,15 @@ mod kernel_tests {
         let err = core.invoke(track(t1, phantom)).unwrap_err();
         assert!(matches!(err, CapabilityError::Rejected(_)));
 
-        // Routing the real net once succeeds; a second route of the same net is rejected.
+        // Routing the real net succeeds; a net is realized by a daisy-chain, so a SECOND track
+        // for the same net is also accepted (the seam no longer caps the per-net track count).
         let t2 = core.fresh_id();
         core.invoke(track(t2, net_id)).unwrap();
         let t3 = core.fresh_id();
-        let err = core.invoke(track(t3, net_id)).unwrap_err();
-        assert!(matches!(err, CapabilityError::Rejected(_)));
+        core.invoke(track(t3, net_id)).unwrap();
 
-        // Exactly one track landed; replay reconstructs byte-identical state.
-        assert_eq!(core.state.tracks.len(), 1);
+        // Both segments landed; replay reconstructs byte-identical state.
+        assert_eq!(core.state.tracks.len(), 2);
         let replayed = replay(core.log()).unwrap();
         assert_eq!(core.state, replayed);
         assert_eq!(core.state.canonical_json(), replayed.canonical_json());

@@ -690,11 +690,18 @@ mod tests {
         assert!(core.state.board.is_some());
         assert!(!core.state.placements.is_empty());
         assert_eq!(core.state.placements.len(), core.state.components.len());
-        // The routing layer exists: every net is realized by exactly one track, and with no
-        // process floor stated the trace-width DRC is clean too. With no operating frequency
-        // stated, the EMC antenna-length analysis is silent as well.
+        // The routing layer exists: every net is realized by copper (a daisy-chain of one or more
+        // segments, so at least one track per net), and with no process floor stated the
+        // trace-width DRC is clean too — including the open-detection rule, since every member pad
+        // lands on the chain. With no operating frequency stated, the EMC antenna-length analysis
+        // is silent as well.
         assert!(!core.state.tracks.is_empty());
-        assert_eq!(core.state.tracks.len(), core.state.nets.len());
+        assert!(core
+            .state
+            .nets
+            .iter()
+            .all(|n| core.state.tracks.iter().any(|t| t.net == n.id)));
+        assert!(core.state.tracks.len() >= core.state.nets.len());
         assert!(core.state.violations.is_empty());
 
         // byte-identical replay holds across the whole 15-phase run.
