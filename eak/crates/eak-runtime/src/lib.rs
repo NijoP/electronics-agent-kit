@@ -52,8 +52,8 @@ mod kernel_tests {
     use super::*;
     use eak_domain::{
         Board, BoardSide, BomLineItem, Component, ComponentClass, Decision, EntityId,
-        FunctionalBlock, Net, NetClass, Part, PartLifecycle, Pin, PinElectricalType, Placement,
-        Priority, Requirement, RequirementCategory, RequirementStatus, Track,
+        FunctionalBlock, LayerStack, Net, NetClass, Part, PartLifecycle, Pin, PinElectricalType,
+        Placement, Priority, Requirement, RequirementCategory, RequirementStatus, Track,
     };
     use eak_ports::{
         Event, EventLog, EventRecord, ReasoningEngine, ReasoningError, ReasoningRequest,
@@ -442,7 +442,7 @@ mod kernel_tests {
             id: core.fresh_id(),
             width: PhysicalQuantity::new(50.0, Unit::Millimetre),
             height: PhysicalQuantity::new(40.0, Unit::Millimetre),
-            layers: 2,
+            stack: LayerStack::standard_two_layer(),
         };
         let board_id = board.id;
         core.invoke(CapabilityRequest::CreateBoard {
@@ -653,7 +653,7 @@ mod kernel_tests {
                 id: board0,
                 width: PhysicalQuantity::new(50.0, Unit::Millimetre),
                 height: PhysicalQuantity::new(50.0, Unit::Millimetre),
-                layers: 2,
+                stack: LayerStack::standard_two_layer(),
             },
             links: vec![],
         })
@@ -665,7 +665,7 @@ mod kernel_tests {
                     id: board1,
                     width: PhysicalQuantity::new(20.0, Unit::Millimetre),
                     height: PhysicalQuantity::new(20.0, Unit::Millimetre),
-                    layers: 2,
+                    stack: LayerStack::standard_two_layer(),
                 },
                 links: vec![],
             })
@@ -878,7 +878,7 @@ mod kernel_tests {
                 id: board_id,
                 width: mm(50.0),
                 height: mm(50.0),
-                layers: 2,
+                stack: LayerStack::standard_two_layer(),
             },
             links: vec![],
         })

@@ -9,7 +9,7 @@
 //! [`StepResult::Done`]. IR projection happens after placement, not here. See
 //! `docs/state-machines/pcb-floor-planning.md`.
 
-use eak_domain::{Board, RequirementCategory};
+use eak_domain::{Board, LayerStack, RequirementCategory};
 use eak_runtime::{AgentContext, CapabilityRequest, Machine, MachineError, StepResult};
 use eak_units::{Dimension, PhysicalQuantity, Unit};
 
@@ -70,7 +70,9 @@ impl Machine for PcbFloorPlanningMachine {
                     id: ctx.fresh_id(),
                     width: edge,
                     height: edge,
-                    layers: 2,
+                    // The stack is a deterministic constant (P4) — never sized from
+                    // requirements or reasoning.
+                    stack: LayerStack::standard_two_layer(),
                 };
                 ctx.invoke(CapabilityRequest::CreateBoard {
                     board,

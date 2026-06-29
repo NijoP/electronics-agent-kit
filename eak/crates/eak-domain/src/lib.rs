@@ -5,7 +5,7 @@
 //! [`ProvenanceLink`]. Downstream entities (Component, Net, Constraint, ...) are NOT
 //! modelled in Phase 1. See `docs/foundation/engineering-domain-model.md`.
 
-use eak_units::PhysicalQuantity;
+use eak_units::{PhysicalQuantity, Unit};
 use serde::{Deserialize, Serialize};
 
 /// Opaque, immutable identity (domain-model modelling principle 1). Carries no meaning;
@@ -473,19 +473,121 @@ pub enum BoardSide {
     Bottom,
 }
 
+/// The role a copper [`Layer`] plays in the stack: a `Signal` layer carries routed tracks; a
+/// `Plane` layer is a solid copper pour (a power/ground reference). The role drives impedance
+/// and return-path reasoning (see `engineering-science/pcb/ground-plane.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum LayerRole {
+    Signal,
+    Plane,
+}
+
+/// One copper layer plus the dielectric beneath it in a [`LayerStack`]. `copper_thickness`
+/// and `dielectric_height` are Length [`PhysicalQuantity`]s (P9, e.g. 35µm = 1oz copper on a
+/// 1.6mm FR-4 core); `dielectric_er` (ε_r, ≥ 1.0) and `loss_tangent` (tan δ, ≥ 0) are
+/// dimensionless ratios — modelled as plain f64 like the existing confidence/reliability
+/// fields, not a new [`eak_units::Dimension`]. Carries `PhysicalQuantity` + f64, so `Layer`
+/// is not `Eq` (exactly like [`Board`]/[`Track`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Layer {
+    pub role: LayerRole,
+    pub copper_thickness: PhysicalQuantity,
+    pub dielectric_height: PhysicalQuantity,
+    pub dielectric_er: f64,
+    pub loss_tangent: f64,
+}
+
+/// The board's copper/dielectric build-up, ordered top→bottom. Replaces a bare layer count so
+/// there is a single source of truth (no count/stack drift) and impedance/return-path
+/// reasoning has real material data to work from. See `engineering-science/pcb/stackup.md`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LayerStack {
+    pub layers: Vec<Layer>,
+}
+
+impl LayerStack {
+    /// The single canonical default: a 2-layer 1.6mm FR-4 board — a top `Signal` layer and a
+    /// bottom `Plane` (ground reference), both 35µm (1oz) copper on the same FR-4 dielectric
+    /// (ε_r 4.5, tan δ 0.02). A deterministic constant (P4): it is never sized from
+    /// requirements or reasoning. Replaces every former `layers: 2`.
+    pub fn standard_two_layer() -> Self {
+        let copper_thickness = PhysicalQuantity::new(0.035, Unit::Millimetre); // 35µm = 1oz
+        let dielectric_height = PhysicalQuantity::new(1.6, Unit::Millimetre); // FR-4 core
+        let dielectric_er = 4.5;
+        let loss_tangent = 0.02;
+        Self {
+            layers: vec![
+                Layer {
+                    role: LayerRole::Signal,
+                    copper_thickness,
+                    dielectric_height,
+                    dielectric_er,
+                    loss_tangent,
+                },
+                Layer {
+                    role: LayerRole::Plane,
+                    copper_thickness,
+                    dielectric_height,
+                    dielectric_er,
+                    loss_tangent,
+                },
+            ],
+        }
+    }
+
+    /// Domain invariants: the stack has at least one layer; every layer has positive, finite
+    /// copper thickness and dielectric height (compared via `si_magnitude()`, P9); a finite
+    /// ε_r ≥ 1.0; and a finite tan δ ≥ 0.0.
+    pub fn validate(&self) -> Result<(), DomainError> {
+        if self.layers.is_empty() {
+            return Err(DomainError::Inconsistent(
+                "board layer stack must have at least one layer",
+            ));
+        }
+        for layer in &self.layers {
+            if !layer.copper_thickness.si_magnitude().is_finite()
+                || layer.copper_thickness.si_magnitude() <= 0.0
+                || !layer.dielectric_height.si_magnitude().is_finite()
+                || layer.dielectric_height.si_magnitude() <= 0.0
+            {
+                return Err(DomainError::Inconsistent(
+                    "layer copper thickness and dielectric height must be positive and finite",
+                ));
+            }
+            if !layer.dielectric_er.is_finite() || layer.dielectric_er < 1.0 {
+                return Err(DomainError::Inconsistent(
+                    "layer dielectric relative permittivity must be finite and at least 1.0",
+                ));
+            }
+            if !layer.loss_tangent.is_finite() || layer.loss_tangent < 0.0 {
+                return Err(DomainError::Inconsistent(
+                    "layer loss tangent must be finite and non-negative",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// The physical board outline the design must fit within: a rectangle of `width` x `height`
-/// with a copper-layer count. Dimensions are typed [`PhysicalQuantity`]s (P9), so placement
-/// DRC stays dimensionally unambiguous; hence `Board` is not `Eq`.
+/// with a typed [`LayerStack`] build-up. Dimensions are typed [`PhysicalQuantity`]s (P9), so
+/// placement DRC stays dimensionally unambiguous; hence `Board` is not `Eq`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Board {
     pub id: EntityId,
     pub width: PhysicalQuantity,
     pub height: PhysicalQuantity,
-    pub layers: u32,
+    pub stack: LayerStack,
 }
 
 impl Board {
-    /// Domain invariants: the outline has positive dimensions and at least one copper layer.
+    /// The number of copper layers in the stack — a convenience accessor for any count reader
+    /// (the [`LayerStack`] is the single source of truth).
+    pub fn layers(&self) -> u32 {
+        self.stack.layers.len() as u32
+    }
+
+    /// Domain invariants: the outline has positive dimensions and a well-formed layer stack.
     /// Dimensions are compared via `si_magnitude()` so the check is unit-independent (P9).
     pub fn validate(&self) -> Result<(), DomainError> {
         if !self.width.si_magnitude().is_finite()
@@ -497,11 +599,7 @@ impl Board {
                 "board dimensions must be positive and finite",
             ));
         }
-        if self.layers == 0 {
-            return Err(DomainError::Inconsistent(
-                "board must have at least one layer",
-            ));
-        }
+        self.stack.validate()?;
         Ok(())
     }
 }
@@ -862,7 +960,7 @@ mod tests {
             id: EntityId(1),
             width: mm(0.0),
             height: mm(50.0),
-            layers: 2,
+            stack: LayerStack::standard_two_layer(),
         };
         assert_eq!(
             zero_width.validate(),
@@ -874,7 +972,7 @@ mod tests {
             id: EntityId(1),
             width: mm(50.0),
             height: mm(-1.0),
-            layers: 2,
+            stack: LayerStack::standard_two_layer(),
         };
         assert_eq!(
             negative_height.validate(),
@@ -885,17 +983,17 @@ mod tests {
     }
 
     #[test]
-    fn board_rejects_zero_layers() {
+    fn board_rejects_empty_stack() {
         let b = Board {
             id: EntityId(1),
             width: mm(50.0),
             height: mm(50.0),
-            layers: 0,
+            stack: LayerStack { layers: vec![] },
         };
         assert_eq!(
             b.validate(),
             Err(DomainError::Inconsistent(
-                "board must have at least one layer"
+                "board layer stack must have at least one layer"
             ))
         );
     }
@@ -906,9 +1004,105 @@ mod tests {
             id: EntityId(1),
             width: mm(50.0),
             height: mm(40.0),
-            layers: 2,
+            stack: LayerStack::standard_two_layer(),
         };
         assert!(b.validate().is_ok());
+        // The convenience accessor reflects the stack's layer count.
+        assert_eq!(b.layers(), 2);
+    }
+
+    #[test]
+    fn standard_two_layer_stack_validates() {
+        let stack = LayerStack::standard_two_layer();
+        assert!(stack.validate().is_ok());
+        assert_eq!(stack.layers.len(), 2);
+        assert_eq!(stack.layers[0].role, LayerRole::Signal);
+        assert_eq!(stack.layers[1].role, LayerRole::Plane);
+    }
+
+    #[test]
+    fn layer_stack_rejects_empty() {
+        let stack = LayerStack { layers: vec![] };
+        assert_eq!(
+            stack.validate(),
+            Err(DomainError::Inconsistent(
+                "board layer stack must have at least one layer"
+            ))
+        );
+    }
+
+    fn good_layer() -> Layer {
+        Layer {
+            role: LayerRole::Signal,
+            copper_thickness: mm(0.035),
+            dielectric_height: mm(1.6),
+            dielectric_er: 4.5,
+            loss_tangent: 0.02,
+        }
+    }
+
+    #[test]
+    fn layer_stack_rejects_non_positive_copper_thickness() {
+        let stack = LayerStack {
+            layers: vec![Layer {
+                copper_thickness: mm(0.0),
+                ..good_layer()
+            }],
+        };
+        assert_eq!(
+            stack.validate(),
+            Err(DomainError::Inconsistent(
+                "layer copper thickness and dielectric height must be positive and finite"
+            ))
+        );
+    }
+
+    #[test]
+    fn layer_stack_rejects_non_positive_dielectric_height() {
+        let stack = LayerStack {
+            layers: vec![Layer {
+                dielectric_height: mm(-1.0),
+                ..good_layer()
+            }],
+        };
+        assert_eq!(
+            stack.validate(),
+            Err(DomainError::Inconsistent(
+                "layer copper thickness and dielectric height must be positive and finite"
+            ))
+        );
+    }
+
+    #[test]
+    fn layer_stack_rejects_permittivity_below_one() {
+        let stack = LayerStack {
+            layers: vec![Layer {
+                dielectric_er: 0.5,
+                ..good_layer()
+            }],
+        };
+        assert_eq!(
+            stack.validate(),
+            Err(DomainError::Inconsistent(
+                "layer dielectric relative permittivity must be finite and at least 1.0"
+            ))
+        );
+    }
+
+    #[test]
+    fn layer_stack_rejects_negative_loss_tangent() {
+        let stack = LayerStack {
+            layers: vec![Layer {
+                loss_tangent: -0.01,
+                ..good_layer()
+            }],
+        };
+        assert_eq!(
+            stack.validate(),
+            Err(DomainError::Inconsistent(
+                "layer loss tangent must be finite and non-negative"
+            ))
+        );
     }
 
     #[test]

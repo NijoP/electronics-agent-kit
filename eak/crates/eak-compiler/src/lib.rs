@@ -438,8 +438,8 @@ impl ManufacturingIr {
 mod tests {
     use super::*;
     use eak_domain::{
-        BoardSide, ComponentClass, NetClass, PartLifecycle, PinElectricalType, Priority,
-        RequirementCategory,
+        BoardSide, ComponentClass, LayerStack, NetClass, PartLifecycle, PinElectricalType,
+        Priority, RequirementCategory,
     };
     use eak_units::{PhysicalQuantity, Unit};
 
@@ -660,7 +660,7 @@ mod tests {
             id: EntityId(id),
             width: qty(100.0),
             height: qty(80.0),
-            layers: 2,
+            stack: LayerStack::standard_two_layer(),
         }
     }
     fn placement(id: u128, component: EntityId) -> Placement {

@@ -1024,7 +1024,7 @@ impl Rule for EmcAntennaLengthRule {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eak_domain::{BoardSide, ConstraintStatus, Priority, RequirementStatus};
+    use eak_domain::{BoardSide, ConstraintStatus, LayerStack, Priority, RequirementStatus};
     use eak_units::Unit;
 
     #[test]
@@ -1377,7 +1377,7 @@ mod tests {
             id: EntityId(id),
             width: mm(w),
             height: mm(h),
-            layers: 2,
+            stack: LayerStack::standard_two_layer(),
         }
     }
 
