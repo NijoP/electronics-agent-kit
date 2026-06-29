@@ -635,9 +635,33 @@ impl Rule for DrcCourtyardOverlapRule {
     }
 }
 
+/// The Length-dimensioned targets stated on [`Fabrication`](RequirementCategory::Fabrication)
+/// requirements, in commit order. Several fab-process floors share this one target space through a
+/// documented POSITIONAL SLOT CONTRACT (no typed discriminator yet): slot 0 = the minimum trace
+/// width ([`DrcTraceWidthRule`]), slot 1 = the board-edge keep-out band
+/// ([`resolve_edge_keepout_si`], used by the DFM rules). A caller takes its slot by position and
+/// falls back to a constant when its slot is unstated, so a lone trace-width target never weakens
+/// the keep-out and vice-versa. A future increment may replace the slots with a typed target role.
+fn fabrication_length_targets(reqs: &[Requirement]) -> impl Iterator<Item = &PhysicalQuantity> {
+    reqs.iter()
+        .filter(|r| r.category == RequirementCategory::Fabrication)
+        .flat_map(|r| r.targets.iter())
+        .filter(|t| t.dimension() == Dimension::Length)
+}
+
+/// The board-edge keep-out band in SI metres: the SECOND Fabrication Length target (slot 1) when
+/// stated, else the [`DFM_EDGE_CLEARANCE_FALLBACK_MM`] constant. Shared by both DFM edge rules so
+/// the placement keep-out and the copper keep-out always agree.
+fn resolve_edge_keepout_si(reqs: &[Requirement]) -> f64 {
+    fabrication_length_targets(reqs)
+        .nth(1)
+        .map(|t| t.si_magnitude())
+        .unwrap_or(DFM_EDGE_CLEARANCE_FALLBACK_MM * 1e-3)
+}
+
 /// DRC rule: every routed [`Track`]'s copper `width` must be at least the design's minimum
-/// manufacturable trace width — the fabrication process floor. The floor is read from the
-/// first length-dimensioned target on a [`Fabrication`](RequirementCategory::Fabrication)
+/// manufacturable trace width — the fabrication process floor. The floor is the FIRST
+/// length-dimensioned target on a [`Fabrication`](RequirementCategory::Fabrication)
 /// requirement (a process limit, e.g. an IPC trace-width class), mirroring how floor planning
 /// takes the board edge from the first Mechanical length target. A trace finer than the floor
 /// cannot be etched by the chosen process, so it is an Error. With no such requirement there is
@@ -666,15 +690,9 @@ impl Rule for DrcTraceWidthRule {
     }
 
     fn evaluate(&self, ctx: &VerificationContext) -> Vec<ViolationFinding> {
-        // The process floor: the first length-dimensioned target on a Fabrication requirement,
-        // in commit order. Absent one, there is no floor to check against.
-        let Some(floor) = ctx
-            .requirements
-            .iter()
-            .filter(|r| r.category == RequirementCategory::Fabrication)
-            .flat_map(|r| r.targets.iter())
-            .find(|t| t.dimension() == Dimension::Length)
-        else {
+        // The process floor: slot 0 of the Fabrication Length targets (the first, in commit
+        // order). Absent one, there is no floor to check against.
+        let Some(floor) = fabrication_length_targets(ctx.requirements).next() else {
             return Vec::new();
         };
         let floor_si = floor.si_magnitude();
@@ -754,19 +772,22 @@ impl Rule for DrcUnroutedNetRule {
 
 // ================================== DFM Rules ==================================
 
-/// The fabrication/assembly keep-out band from the board edge, in millimetres. Component
-/// bodies and copper inside this band foul pick-and-place and are nicked during
-/// depanelization, so a design that merely *fits* the outline can still be unmanufacturable. A
-/// fixed process constant in Phase-3 scope (a real flow derives it from the fab/assembly
-/// class); kept below the placement margin so a normally-placed design clears it.
-const DFM_EDGE_CLEARANCE_MM: f64 = 0.5;
+/// The DEFAULT fabrication/assembly keep-out band from the board edge, in millimetres — the
+/// fallback used when no fab-process keep-out is stated. Component bodies and copper inside this
+/// band foul pick-and-place and are nicked during depanelization, so a design that merely *fits*
+/// the outline can still be unmanufacturable. A design pins the real band on a
+/// [`Fabrication`](RequirementCategory::Fabrication) requirement (slot 1, see
+/// [`resolve_edge_keepout_si`]); absent one, this constant applies. Kept below the placement
+/// margin so a normally-placed design clears it.
+const DFM_EDGE_CLEARANCE_FALLBACK_MM: f64 = 0.5;
 
-/// DFM rule: every [`Placement`]'s courtyard must keep at least [`DFM_EDGE_CLEARANCE_MM`] from
-/// the [`Board`] edge. Distinct from [`DrcOutOfBoundsRule`], which only requires the courtyard
-/// to *fit*: this demands an assembly keep-out band, so a component that fits but hugs the edge
-/// is a manufacturability Error. Comparisons are on the SI axis via `si_magnitude()` (P9); with
-/// no board there is no edge to measure from, so the rule emits nothing. Placements are scanned
-/// in slice order for determinism.
+/// DFM rule: every [`Placement`]'s courtyard must keep at least the fabrication keep-out band
+/// (slot 1 of the Fabrication Length targets, else the fallback — see [`resolve_edge_keepout_si`])
+/// from the [`Board`] edge. Distinct from [`DrcOutOfBoundsRule`], which only requires the
+/// courtyard to *fit*: this demands an assembly keep-out band, so a component that fits but hugs
+/// the edge is a manufacturability Error. Comparisons are on the SI axis via `si_magnitude()` (P9);
+/// with no board there is no edge to measure from, so the rule emits nothing. Placements are
+/// scanned in slice order for determinism.
 pub struct DfmEdgeClearanceRule;
 
 impl DfmEdgeClearanceRule {
@@ -792,7 +813,7 @@ impl Rule for DfmEdgeClearanceRule {
             return Vec::new();
         };
         let (board_w, board_h) = (board.width.si_magnitude(), board.height.si_magnitude());
-        let m = DFM_EDGE_CLEARANCE_MM * 1e-3; // millimetres -> metres (SI)
+        let m = resolve_edge_keepout_si(ctx.requirements); // SI metres
         let mut findings = Vec::new();
         for placement in ctx.placements.iter() {
             let x = placement.x.si_magnitude();
@@ -805,9 +826,9 @@ impl Rule for DfmEdgeClearanceRule {
                     severity: ViolationSeverity::Error,
                     subjects: vec![placement.id],
                     message: format!(
-                        "placement {} is within the {} mm board-edge keep-out",
+                        "placement {} is within the {:.3} mm board-edge keep-out",
                         placement.id.short(),
-                        DFM_EDGE_CLEARANCE_MM
+                        m * 1e3
                     ),
                 });
             }
@@ -816,7 +837,8 @@ impl Rule for DfmEdgeClearanceRule {
     }
 }
 
-/// DFM rule: every [`Track`]'s copper must keep at least [`DFM_EDGE_CLEARANCE_MM`] from the
+/// DFM rule: every [`Track`]'s copper must keep at least the fabrication keep-out band (the same
+/// resolved band as [`DfmEdgeClearanceRule`], see [`resolve_edge_keepout_si`]) from the
 /// [`Board`] edge — edge copper is nicked during depanelization. The keep-out is four
 /// axis-aligned edge bands. Because `x` and `y` vary linearly along a straight segment, the
 /// copper band's extreme reach in each axis (the centre-line extreme ± half the width) occurs at
@@ -848,7 +870,7 @@ impl Rule for DfmTraceEdgeClearanceRule {
             return Vec::new();
         };
         let (board_w, board_h) = (board.width.si_magnitude(), board.height.si_magnitude());
-        let m = DFM_EDGE_CLEARANCE_MM * 1e-3; // millimetres -> metres (SI)
+        let m = resolve_edge_keepout_si(ctx.requirements); // SI metres
         let mut findings = Vec::new();
         for track in ctx.tracks.iter() {
             let half = track.width.si_magnitude() / 2.0;
@@ -862,9 +884,9 @@ impl Rule for DfmTraceEdgeClearanceRule {
                     severity: ViolationSeverity::Error,
                     subjects: vec![track.id],
                     message: format!(
-                        "track {} copper is within the {} mm board-edge keep-out",
+                        "track {} copper is within the {:.3} mm board-edge keep-out",
                         track.id.short(),
-                        DFM_EDGE_CLEARANCE_MM
+                        m * 1e3
                     ),
                 });
             }
@@ -1708,6 +1730,134 @@ mod tests {
         let tracks = vec![edge_track(10, 0.1, 0.1, 90.0, 0.1, 0.25)];
         assert!(DfmTraceEdgeClearanceRule::new()
             .evaluate(&dfm_track_ctx(None, &tracks))
+            .is_empty());
+    }
+
+    // ------------------- fabrication-sourced edge-clearance keep-out tests -------------------
+
+    /// A Fabrication requirement carrying Length targets in slot order: slot 0 = minimum trace
+    /// width, slot 1 = board-edge keep-out band.
+    fn fab_req(id: u128, mm_targets: &[f64]) -> Requirement {
+        Requirement {
+            id: EntityId(id),
+            statement: "Fabrication process limits".into(),
+            category: RequirementCategory::Fabrication,
+            priority: Priority::High,
+            acceptance_criterion: "process limits met".into(),
+            status: RequirementStatus::Accepted,
+            source: EntityId(1),
+            targets: mm_targets.iter().map(|&v| mm(v)).collect(),
+        }
+    }
+
+    fn keepout_ctx<'a>(
+        board: Option<&'a Board>,
+        placements: &'a [Placement],
+        requirements: &'a [Requirement],
+    ) -> VerificationContext<'a> {
+        VerificationContext {
+            requirements,
+            constraints: &[],
+            components: &[],
+            pins: &[],
+            nets: &[],
+            parts: &[],
+            bom_line_items: &[],
+            board,
+            placements,
+            tracks: &[],
+        }
+    }
+
+    fn keepout_track_ctx<'a>(
+        board: Option<&'a Board>,
+        tracks: &'a [Track],
+        requirements: &'a [Requirement],
+    ) -> VerificationContext<'a> {
+        VerificationContext {
+            requirements,
+            constraints: &[],
+            components: &[],
+            pins: &[],
+            nets: &[],
+            parts: &[],
+            bom_line_items: &[],
+            board,
+            placements: &[],
+            tracks,
+        }
+    }
+
+    #[test]
+    fn stated_keepout_widens_the_band() {
+        let b = board(1, 100.0, 80.0);
+        // Courtyard right edge at 99.3 mm — 0.7 mm from the board edge: clears the 0.5 mm fallback,
+        // but a stated slot-1 keep-out of 1.0 mm flags it. (slot 0 = 0.25 mm trace width.)
+        let placements = vec![placement(10, 900, 79.3, 10.0, 20.0, 20.0, BoardSide::Top)];
+        assert!(DfmEdgeClearanceRule::new()
+            .evaluate(&keepout_ctx(Some(&b), &placements, &[]))
+            .is_empty());
+        let reqs = vec![fab_req(700, &[0.25, 1.0])];
+        let findings =
+            DfmEdgeClearanceRule::new().evaluate(&keepout_ctx(Some(&b), &placements, &reqs));
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].subjects, vec![EntityId(10)]);
+    }
+
+    #[test]
+    fn stated_keepout_can_relax_a_fallback_failure() {
+        let b = board(1, 100.0, 80.0);
+        // 0.3 mm from the right edge: fails the 0.5 mm fallback, but a stated slot-1 keep-out of
+        // 0.25 mm clears it (and it still fits the outline, so DRC out-of-bounds is clean).
+        let placements = vec![placement(10, 900, 79.7, 10.0, 20.0, 20.0, BoardSide::Top)];
+        assert_eq!(
+            DfmEdgeClearanceRule::new()
+                .evaluate(&keepout_ctx(Some(&b), &placements, &[]))
+                .len(),
+            1
+        );
+        let reqs = vec![fab_req(700, &[0.25, 0.25])];
+        assert!(DfmEdgeClearanceRule::new()
+            .evaluate(&keepout_ctx(Some(&b), &placements, &reqs))
+            .is_empty());
+    }
+
+    #[test]
+    fn lone_trace_floor_leaves_keepout_at_fallback_and_still_floors_traces() {
+        let b = board(1, 100.0, 80.0);
+        // Only a slot-0 (trace-width) Fabrication target is stated: the keep-out must NOT claim it
+        // — it stays at the 0.5 mm fallback, so a 0.3-mm-from-edge courtyard is still flagged.
+        let placements = vec![placement(10, 900, 79.7, 10.0, 20.0, 20.0, BoardSide::Top)];
+        let reqs = vec![fab_req(700, &[0.25])];
+        assert_eq!(
+            DfmEdgeClearanceRule::new()
+                .evaluate(&keepout_ctx(Some(&b), &placements, &reqs))
+                .len(),
+            1
+        );
+        // ...and the trace-width rule still reads that lone slot-0 value as its floor.
+        let tracks = vec![track(11, 0.20)];
+        let tw = DrcTraceWidthRule::new().evaluate(&trace_ctx(&reqs, &tracks));
+        assert_eq!(tw.len(), 1);
+        assert_eq!(tw[0].subjects, vec![EntityId(11)]);
+    }
+
+    #[test]
+    fn trace_edge_rule_honours_the_resolved_keepout() {
+        let b = board(1, 100.0, 80.0);
+        // Copper edge ~0.3 mm from the board edge (centre 0.425 mm, half-width 0.125 mm): flagged
+        // at the 0.5 mm fallback, cleared by a stated 0.25 mm keep-out — the copper band tracks the
+        // same resolver as placements.
+        let tracks = vec![edge_track(10, 0.425, 40.0, 90.0, 40.0, 0.25)];
+        assert_eq!(
+            DfmTraceEdgeClearanceRule::new()
+                .evaluate(&keepout_track_ctx(Some(&b), &tracks, &[]))
+                .len(),
+            1
+        );
+        let reqs = vec![fab_req(700, &[0.25, 0.25])];
+        assert!(DfmTraceEdgeClearanceRule::new()
+            .evaluate(&keepout_track_ctx(Some(&b), &tracks, &reqs))
             .is_empty());
     }
 
