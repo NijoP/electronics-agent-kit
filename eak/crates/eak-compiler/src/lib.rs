@@ -514,6 +514,7 @@ mod tests {
             class: NetClass::Power,
             members,
             current: None,
+            impedance_target: None,
         }
     }
 

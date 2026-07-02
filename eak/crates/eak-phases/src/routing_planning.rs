@@ -12,7 +12,10 @@
 //! `docs/state-machines/routing-planning.md`.
 
 use eak_compiler::{EngineeringIr, PcbIr, RequirementIr, SchematicIr};
-use eak_domain::{BoardSide, EntityId, NetClass, Placement, ProvenanceLink, RelationType, Track};
+use eak_domain::{
+    BoardSide, EntityId, Layer, Net, NetClass, Placement, ProvenanceLink, RelationType, Track,
+};
+use eak_engines::microstrip_width;
 use eak_ports::Event;
 use eak_runtime::{AgentContext, CapabilityRequest, Machine, MachineError, StepResult};
 use eak_units::{PhysicalQuantity, Unit};
@@ -36,6 +39,26 @@ fn class_width_mm(class: NetClass) -> f64 {
         NetClass::Ground => GROUND_TRACE_WIDTH_MM,
         NetClass::Signal => SIGNAL_TRACE_WIDTH_MM,
     }
+}
+
+/// The copper width (mm) to route `net` with over the reference stack layer `ref_layer` (the outer
+/// signal layer this pass lays tracks on). A net that declares an `impedance_target` is sized to
+/// the stack-up-derived microstrip width that realizes that Z₀ ([`microstrip_width`], using the
+/// layer's `ε_r`/`h`/`t`) — the increment-12 keystone paying off: a real dielectric height and
+/// copper thickness make the width a computed quantity, not a class constant. If the target is
+/// infeasible on this stack (no positive width realizes it), or the net is uncontrolled, the
+/// per-class default applies; an infeasible controlled net is then flagged by `drc-impedance-match`
+/// and looped back (the honest "stack-up cannot meet the target" signal), never silently clamped.
+/// Pure and deterministic, so the resolved width replays identically (P4).
+fn resolve_width_mm(net: &Net, ref_layer: Option<&Layer>) -> f64 {
+    if let (Some(z0), Some(layer)) = (net.impedance_target.as_ref(), ref_layer) {
+        let h_mm = layer.dielectric_height.si_magnitude() * 1e3;
+        let t_mm = layer.copper_thickness.si_magnitude() * 1e3;
+        if let Some(w) = microstrip_width(z0.si_magnitude(), layer.dielectric_er, h_mm, t_mm) {
+            return w;
+        }
+    }
+    class_width_mm(net.class)
 }
 
 pub struct RoutingPlanningMachine;
@@ -76,6 +99,15 @@ impl Machine for RoutingPlanningMachine {
                         "cannot route nets before the board outline exists".into(),
                     ));
                 }
+
+                // The outer signal layer that controlled-impedance widths are sized against — this
+                // pass lays every track on `Top`, so the reference is the stack's first (top) layer.
+                // Cloned once so the per-net width resolver can borrow a stable value. When Bottom
+                // routing is added, resolve this per-track via the stack's bottom layer (the DRC
+                // `drc-impedance-match` rule already dispatches on `BoardSide`); until then `first()`
+                // is correct precisely because every track is Top.
+                let ref_layer: Option<Layer> =
+                    ctx.board().and_then(|b| b.stack.layers.first().cloned());
 
                 let nets = ctx.nets();
                 let pins = ctx.pins();
@@ -139,16 +171,18 @@ impl Machine for RoutingPlanningMachine {
                     // all k-1 mint in one pass before `Done`, and the `routed.contains` guard above
                     // skips an already-realized net on re-entry, so a DRC loop-back never
                     // double-mints (idempotent).
+                    // The net's copper width: the stack-up-derived microstrip width when it declares
+                    // a controlled-impedance target, else the per-class default (resolved once; all
+                    // of a net's daisy segments share one width).
+                    let width_mm = resolve_width_mm(net, ref_layer.as_ref());
+
                     for (from, to) in daisy_chain_segments(&members) {
                         let tid = ctx.fresh_id();
                         let track = Track {
                             id: tid,
                             net: net.id,
                             layer: BoardSide::Top,
-                            width: PhysicalQuantity::new(
-                                class_width_mm(net.class),
-                                Unit::Millimetre,
-                            ),
+                            width: PhysicalQuantity::new(width_mm, Unit::Millimetre),
                             x1: PhysicalQuantity::new(
                                 center_mm(from.x, from.width),
                                 Unit::Millimetre,
@@ -244,6 +278,55 @@ fn project_pcb(ctx: &mut dyn AgentContext) -> Result<PcbIr, MachineError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eak_domain::{LayerRole, LayerStack};
+
+    /// A net with the given optional controlled-impedance target (Ω) on a Signal class.
+    fn signal_net(id: u128, impedance_ohm: Option<f64>) -> Net {
+        Net {
+            id: EntityId(id),
+            name: format!("NET{id}"),
+            class: NetClass::Signal,
+            members: vec![],
+            current: None,
+            impedance_target: impedance_ohm.map(|z| PhysicalQuantity::new(z, Unit::Ohm)),
+        }
+    }
+
+    #[test]
+    fn controlled_net_is_sized_to_the_stack_up_derived_width() {
+        // On the standard 1.6 mm FR-4 stack, a 50 Ω target resolves to ~2.914 mm — not the flat
+        // 0.25 mm signal default. This is the increment-12 LayerStack paying off in a real width.
+        let top = LayerStack::standard_two_layer().layers[0].clone();
+        let w = resolve_width_mm(&signal_net(1, Some(50.0)), Some(&top));
+        assert!((w - 2.914).abs() < 0.01, "expected ~2.914 mm, got {w}");
+        assert!(w > class_width_mm(NetClass::Signal));
+    }
+
+    #[test]
+    fn uncontrolled_net_keeps_the_class_default_width() {
+        let top = LayerStack::standard_two_layer().layers[0].clone();
+        assert_eq!(
+            resolve_width_mm(&signal_net(2, None), Some(&top)),
+            class_width_mm(NetClass::Signal)
+        );
+    }
+
+    #[test]
+    fn infeasible_impedance_target_falls_back_to_the_class_default() {
+        // A thin 0.2 mm dielectric cannot realize 130 Ω at any positive width, so the resolver
+        // does NOT clamp — it falls back to the class default and lets drc-impedance-match flag it.
+        let thin = Layer {
+            role: LayerRole::Signal,
+            copper_thickness: PhysicalQuantity::new(0.035, Unit::Millimetre),
+            dielectric_height: PhysicalQuantity::new(0.2, Unit::Millimetre),
+            dielectric_er: 4.5,
+            loss_tangent: 0.02,
+        };
+        assert_eq!(
+            resolve_width_mm(&signal_net(3, Some(130.0)), Some(&thin)),
+            class_width_mm(NetClass::Signal)
+        );
+    }
 
     #[test]
     fn power_and_ground_default_wider_than_signal() {

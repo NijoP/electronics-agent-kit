@@ -237,6 +237,7 @@ mod kernel_tests {
                 class: NetClass::Power,
                 members: vec![pid],
                 current: None,
+                impedance_target: None,
             },
             links: vec![],
         })
@@ -613,6 +614,7 @@ mod kernel_tests {
                     class: NetClass::Ground,
                     members: vec![],
                     current: None,
+                    impedance_target: None,
                 },
                 links: vec![],
             })
@@ -865,6 +867,7 @@ mod kernel_tests {
                 class: NetClass::Power,
                 members: vec![pin_id],
                 current: None,
+                impedance_target: None,
             },
             links: vec![],
         })

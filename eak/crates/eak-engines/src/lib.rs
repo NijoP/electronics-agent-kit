@@ -7,8 +7,8 @@
 
 use eak_domain::{
     Board, BoardSide, BomLineItem, Component, ComponentClass, Constraint, ConstraintKind, EntityId,
-    LayerStack, Net, NetClass, Part, PartLifecycle, Pin, PinElectricalType, Placement, Requirement,
-    RequirementCategory, Track, Violation, ViolationSeverity,
+    Layer, LayerStack, Net, NetClass, Part, PartLifecycle, Pin, PinElectricalType, Placement,
+    Requirement, RequirementCategory, Track, Violation, ViolationSeverity,
 };
 use eak_units::{Dimension, PhysicalQuantity, Unit, UnitError};
 use std::cmp::Ordering;
@@ -1229,6 +1229,172 @@ impl Rule for DrcAmpacityWidthRule {
     }
 }
 
+// ===== Controlled-impedance microstrip model (IPC-2141 / stackup.md clause 3) =====
+
+/// The IPC-2141 microstrip constant `87` in `Z₀ ≈ (87/√(ε_r+1.41))·ln(5.98h/(0.8w+t))`.
+const MICROSTRIP_C0: f64 = 87.0;
+/// The `+1.41` effective-permittivity offset under the square root.
+const MICROSTRIP_ER_OFFSET: f64 = 1.41;
+/// The `5.98` height coefficient in the log argument.
+const MICROSTRIP_H_COEFF: f64 = 5.98;
+/// The `0.8` width coefficient in the log argument.
+const MICROSTRIP_W_COEFF: f64 = 0.8;
+/// The realized-vs-target characteristic-impedance tolerance band: a routed width whose realized
+/// Z₀ deviates from the net's target by more than ±10 % is a controlled-impedance violation
+/// (`engineering-science/electrical/transmission-lines.md`; the `±10 %` typed constraint band).
+const IMPEDANCE_TOLERANCE: f64 = 0.10;
+
+/// The characteristic impedance Z₀ (Ω) of a microstrip trace of width `w_mm` and copper thickness
+/// `t_mm` over a dielectric of height `h_mm` and relative permittivity `er`, via the IPC-2141
+/// closed form (`stackup.md` clause 3). All three lengths must be in the same unit (the log
+/// argument is dimensionless). Z₀ is strictly decreasing in `w`, so there is exactly one width per
+/// stack that hits a target — see [`microstrip_width`], its inverse. First-order engineering
+/// approximation, not a field solver; adequate for a first-pass width, and the realized Z₀ the
+/// verification rule reports back.
+pub fn microstrip_z0(er: f64, h_mm: f64, w_mm: f64, t_mm: f64) -> f64 {
+    (MICROSTRIP_C0 / (er + MICROSTRIP_ER_OFFSET).sqrt())
+        * (MICROSTRIP_H_COEFF * h_mm / (MICROSTRIP_W_COEFF * w_mm + t_mm)).ln()
+}
+
+/// The microstrip trace width (mm) that realizes the target characteristic impedance `z0` (Ω) on a
+/// stack of dielectric height `h_mm`, permittivity `er`, and copper thickness `t_mm` — the inverse
+/// of [`microstrip_z0`]: `w = (5.98·h·e^(−E) − t)/0.8` with `E = z0·√(er+1.41)/87`. Returns `None`
+/// when the result is non-physical (`w ≤ 0`), which means the target lies above the stack's
+/// achievable impedance ceiling `Z₀_max = (87/√(er+1.41))·ln(5.98h/t)` — the dielectric is too thin
+/// (or too few layers) to realize this Z₀ at any positive width. That is the recoverable
+/// "stack-up infeasible for the impedance target" case (`stackup.md` clause 7), NOT a value to
+/// clamp silently.
+pub fn microstrip_width(z0: f64, er: f64, h_mm: f64, t_mm: f64) -> Option<f64> {
+    let e = z0 * (er + MICROSTRIP_ER_OFFSET).sqrt() / MICROSTRIP_C0;
+    let w = (MICROSTRIP_H_COEFF * h_mm * (-e).exp() - t_mm) / MICROSTRIP_W_COEFF;
+    (w.is_finite() && w > 0.0).then_some(w)
+}
+
+/// The voltage reflection coefficient `Γ = (Z_real − Z_target)/(Z_real + Z_target)` — the
+/// physically-meaningful measure of an impedance mismatch (`transmission-lines.md`): `Γ = 0` is a
+/// matched, invisible line; `|Γ|` grows with the mismatch. Used to describe a controlled-impedance
+/// violation.
+pub fn reflection_gamma(z0_real: f64, z0_target: f64) -> f64 {
+    (z0_real - z0_target) / (z0_real + z0_target)
+}
+
+/// The stack layer a [`Track`] on `side` references for its microstrip model: routing lays tracks
+/// on an outer [`BoardSide`], and a [`LayerStack`] is ordered top→bottom, so `Top` references the
+/// first (top) layer and `Bottom` the last. The layer carries the microstrip `h` (its
+/// `dielectric_height`), `ε_r`, and `t` (its `copper_thickness`). `None` when the stack is empty.
+fn reference_layer_for_side(stack: &LayerStack, side: BoardSide) -> Option<&Layer> {
+    match side {
+        BoardSide::Top => stack.layers.first(),
+        BoardSide::Bottom => stack.layers.last(),
+    }
+}
+
+/// DRC rule: every routed [`Track`] whose [`Net`] declares an `impedance_target` must realize a
+/// characteristic impedance within ±10 % of that target. The realized Z₀ is [`microstrip_z0`]
+/// evaluated on the track's width and its reference stack layer's `ε_r`/`h`/`t`; the deviation is
+/// reported as the reflection coefficient [`reflection_gamma`]. A width whose Z₀ strays past the
+/// tolerance guarantees reflections (`Γ ≠ 0`) on a line that was declared controlled, so it is a
+/// blocking Error. Routing sizes a controlled net's width from [`microstrip_width`], so on a
+/// feasible stack this rule is silent; it fires when the target is infeasible for the stack (routing
+/// fell back to the class default) or a hand-set width drifts — the check that makes the impedance
+/// target *enforced* rather than merely declared.
+///
+/// TARGET SOURCE: the per-net [`Net::impedance_target`]. A net that declares no target is
+/// uncontrolled and the rule emits nothing for it (the per-net "no input → silent" discipline); with
+/// no board there is no stack to model the microstrip against, so the rule is likewise silent.
+/// Comparisons use the relative ±10 % band (a fractional tolerance, not the SI-axis nm epsilon the
+/// geometry rules use, because impedance is not a length); tracks are scanned in slice order for
+/// determinism (P4). A flagged track implicates itself
+/// (`Violation → Track → Net → … → Requirement → Intent`, P3).
+pub struct DrcImpedanceMatchRule;
+
+impl DrcImpedanceMatchRule {
+    pub const ID: &'static str = "drc-impedance-match";
+
+    pub fn new() -> Self {
+        Self
+    }
+}
+impl Default for DrcImpedanceMatchRule {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Rule for DrcImpedanceMatchRule {
+    fn id(&self) -> &str {
+        Self::ID
+    }
+
+    fn evaluate(&self, ctx: &VerificationContext) -> Vec<ViolationFinding> {
+        // The microstrip model needs the board's LayerStack; with no board the rule is silent.
+        let Some(board) = ctx.board else {
+            return Vec::new();
+        };
+        let mut findings = Vec::new();
+        for track in ctx.tracks.iter() {
+            // Only nets that DECLARE a controlled-impedance target are checked; absent one the net
+            // is uncontrolled and the rule emits nothing rather than inventing a target.
+            let Some(net) = ctx.nets.iter().find(|n| n.id == track.net) else {
+                continue;
+            };
+            let Some(target) = net.impedance_target.as_ref() else {
+                continue;
+            };
+            let target_ohm = target.si_magnitude();
+            if !target_ohm.is_finite() || target_ohm <= 0.0 {
+                continue; // Net::validate rejects these; defensive skip keeps the rule total.
+            }
+            let Some(layer) = reference_layer_for_side(&board.stack, track.layer) else {
+                continue;
+            };
+            let h_mm = layer.dielectric_height.si_magnitude() * 1e3;
+            let t_mm = layer.copper_thickness.si_magnitude() * 1e3;
+            let w_mm = track.width.si_magnitude() * 1e3;
+            let z0_real = microstrip_z0(layer.dielectric_er, h_mm, w_mm, t_mm);
+            // A width so wide that `0.8w + t ≥ 5.98h` drives the log argument ≤ 1, pushing the
+            // modelled Z₀ ≤ 0 — outside IPC-2141 microstrip validity. Routing never mints such a
+            // width for a controlled net ([`microstrip_width`] guards `w > 0`), but a hand-set
+            // width could; flag it as its own validity violation rather than emitting a
+            // divide-by-zero Γ.
+            if !z0_real.is_finite() || z0_real <= 0.0 {
+                findings.push(ViolationFinding {
+                    rule: Self::ID.to_string(),
+                    severity: ViolationSeverity::Error,
+                    subjects: vec![track.id],
+                    message: format!(
+                        "track {} width {} is too wide to model as a microstrip for net {}'s {} target (outside IPC-2141 validity)",
+                        track.id.short(),
+                        track.width,
+                        net.id.short(),
+                        target,
+                    ),
+                });
+                continue;
+            }
+            let deviation = (z0_real - target_ohm).abs() / target_ohm;
+            if deviation > IMPEDANCE_TOLERANCE {
+                let gamma = reflection_gamma(z0_real, target_ohm);
+                findings.push(ViolationFinding {
+                    rule: Self::ID.to_string(),
+                    severity: ViolationSeverity::Error,
+                    subjects: vec![track.id],
+                    message: format!(
+                        "track {} realizes {:.1} ohm (gamma {:+.3}) but net {} targets {} — past the {:.0}% controlled-impedance band",
+                        track.id.short(),
+                        z0_real,
+                        gamma,
+                        net.id.short(),
+                        target,
+                        IMPEDANCE_TOLERANCE * 100.0,
+                    ),
+                });
+            }
+        }
+        findings
+    }
+}
+
 // ================================== DFM Rules ==================================
 
 /// The DEFAULT fabrication/assembly keep-out band from the board edge, in millimetres — the
@@ -1639,6 +1805,7 @@ mod tests {
             class,
             members: members.into_iter().map(EntityId).collect(),
             current: None,
+            impedance_target: None,
         }
     }
 
@@ -1649,6 +1816,18 @@ mod tests {
             class,
             members: vec![],
             current: Some(PhysicalQuantity::new(current_a, Unit::Ampere)),
+            impedance_target: None,
+        }
+    }
+
+    fn net_with_impedance(id: u128, ohms: f64) -> Net {
+        Net {
+            id: EntityId(id),
+            name: format!("NET{id}"),
+            class: NetClass::Signal,
+            members: vec![],
+            current: None,
+            impedance_target: Some(PhysicalQuantity::new(ohms, Unit::Ohm)),
         }
     }
 
@@ -1965,6 +2144,99 @@ mod tests {
         assert!(DrcAmpacityWidthRule::new()
             .evaluate(&ampacity_ctx(None, &nets, &tracks))
             .is_empty());
+    }
+
+    #[test]
+    fn microstrip_inversion_round_trips() {
+        // 50 Ω on the standard 1.6 mm FR-4 stack (ε_r 4.5, 1 oz Cu) resolves to ~2.914 mm...
+        let w = microstrip_width(50.0, 4.5, 1.6, 0.035).expect("50 Ω is feasible on this stack");
+        assert!((w - 2.914).abs() < 0.01, "expected ~2.914 mm, got {w}");
+        // ...and that width fed back through the forward model realizes ~50 Ω (the round trip closes).
+        let z0 = microstrip_z0(4.5, 1.6, w, 0.035);
+        // The inverse is exact, so the round-trip closes to float precision — a tight bound pins
+        // the two closed forms as algebraic inverses, not merely "close".
+        assert!((z0 - 50.0).abs() < 1e-8, "round-trip Z0 = {z0}");
+    }
+
+    #[test]
+    fn microstrip_z0_decreases_with_width() {
+        // Wider copper → lower impedance: the monotonicity that makes the width unique per target.
+        let narrow = microstrip_z0(4.5, 1.6, 0.5, 0.035);
+        let wide = microstrip_z0(4.5, 1.6, 3.0, 0.035);
+        assert!(narrow > wide, "narrow {narrow} should exceed wide {wide}");
+    }
+
+    #[test]
+    fn microstrip_width_is_none_above_the_stack_ceiling() {
+        // 130 Ω on a thin 0.2 mm dielectric is above the achievable ceiling → no positive width.
+        assert!(microstrip_width(130.0, 4.5, 0.2, 0.035).is_none());
+    }
+
+    #[test]
+    fn reflection_gamma_is_zero_when_matched() {
+        assert!(reflection_gamma(50.0, 50.0).abs() < 1e-12);
+        assert!(reflection_gamma(75.0, 50.0) > 0.0); // realized above target → positive Γ
+    }
+
+    #[test]
+    fn impedance_matched_track_passes() {
+        let b = board(1, 100.0, 80.0);
+        let nets = vec![net_with_impedance(910, 50.0)];
+        // 2.914 mm realizes ~50 Ω on the standard stack — inside the ±10 % band.
+        let tracks = vec![track(10, 2.914)];
+        assert!(DrcImpedanceMatchRule::new()
+            .evaluate(&ampacity_ctx(Some(&b), &nets, &tracks))
+            .is_empty());
+    }
+
+    #[test]
+    fn impedance_mismatched_track_is_flagged() {
+        let b = board(1, 100.0, 80.0);
+        let nets = vec![net_with_impedance(910, 50.0)];
+        // The flat 0.25 mm signal default realizes ~133 Ω on this stack — far past ±10 %.
+        let tracks = vec![track(10, 0.25)];
+        let findings =
+            DrcImpedanceMatchRule::new().evaluate(&ampacity_ctx(Some(&b), &nets, &tracks));
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule, DrcImpedanceMatchRule::ID);
+        assert_eq!(findings[0].severity, ViolationSeverity::Error);
+        assert_eq!(findings[0].subjects, vec![EntityId(10)]);
+    }
+
+    #[test]
+    fn uncontrolled_net_has_no_impedance_check() {
+        let b = board(1, 100.0, 80.0);
+        // No impedance target: even the mismatched 0.25 mm default is silent (the net is uncontrolled).
+        let nets = vec![net(910, NetClass::Signal, vec![])];
+        let tracks = vec![track(10, 0.25)];
+        assert!(DrcImpedanceMatchRule::new()
+            .evaluate(&ampacity_ctx(Some(&b), &nets, &tracks))
+            .is_empty());
+    }
+
+    #[test]
+    fn impedance_is_silent_without_a_board() {
+        // No board → no LayerStack → no microstrip model to realize Z₀ against, so the rule is silent.
+        let nets = vec![net_with_impedance(910, 50.0)];
+        let tracks = vec![track(10, 0.25)];
+        assert!(DrcImpedanceMatchRule::new()
+            .evaluate(&ampacity_ctx(None, &nets, &tracks))
+            .is_empty());
+    }
+
+    #[test]
+    fn absurdly_wide_controlled_track_is_flagged_as_out_of_validity() {
+        let b = board(1, 100.0, 80.0);
+        let nets = vec![net_with_impedance(910, 50.0)];
+        // 15 mm on the 1.6 mm stack drives 0.8w+t past 5.98h, so the modelled Z₀ goes non-physical
+        // (≤ 0). The rule flags it via the validity guard rather than dividing by zero in Γ.
+        let tracks = vec![track(10, 15.0)];
+        let findings =
+            DrcImpedanceMatchRule::new().evaluate(&ampacity_ctx(Some(&b), &nets, &tracks));
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule, DrcImpedanceMatchRule::ID);
+        assert_eq!(findings[0].subjects, vec![EntityId(10)]);
+        assert!(findings[0].message.contains("validity"));
     }
 
     #[test]

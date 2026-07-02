@@ -370,12 +370,19 @@ pub struct Net {
     /// The net's worst-case DC current, if known (a typed Current quantity). `None` = unstated,
     /// in which case the ampacity width floor is not computed for this net.
     pub current: Option<PhysicalQuantity>,
+    /// The net's controlled characteristic-impedance target, if any — a typed Resistance/Ω
+    /// quantity (e.g. 50 Ω single-ended). `None` = uncontrolled, so Routing keeps the per-class
+    /// default width and the impedance-match check stays silent. When `Some`, Routing sizes the
+    /// trace to the stack-up-derived microstrip width and `drc-impedance-match` confirms the
+    /// realized Z₀ is within tolerance (see `engineering-science/electrical/transmission-lines.md`).
+    pub impedance_target: Option<PhysicalQuantity>,
 }
 
 impl Net {
-    /// Domain invariant: a net carries a non-empty name; and if a `current` is stated it is a
-    /// finite, positive Current quantity — a net cannot carry a negative or dimensionally-wrong
-    /// load (P9). Member-pin integrity (each id exists) is re-checked at the capability seam (P3).
+    /// Domain invariant: a net carries a non-empty name; if a `current` is stated it is a finite,
+    /// positive Current quantity (a net cannot carry a negative or dimensionally-wrong load); and
+    /// if an `impedance_target` is stated it is a finite, positive Resistance (Ω) quantity (P9).
+    /// Member-pin integrity (each id exists) is re-checked at the capability seam (P3).
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.name.trim().is_empty() {
             return Err(DomainError::EmptyField("net name"));
@@ -387,6 +394,16 @@ impl Net {
             {
                 return Err(DomainError::Inconsistent(
                     "net current must be a finite, positive Current quantity",
+                ));
+            }
+        }
+        if let Some(z0) = &self.impedance_target {
+            if z0.dimension() != Dimension::Resistance
+                || !z0.si_magnitude().is_finite()
+                || z0.si_magnitude() <= 0.0
+            {
+                return Err(DomainError::Inconsistent(
+                    "net impedance target must be a finite, positive Resistance quantity",
                 ));
             }
         }
@@ -929,6 +946,7 @@ mod tests {
             class: NetClass::Power,
             members: vec![EntityId(2), EntityId(3)],
             current: None,
+            impedance_target: None,
         };
         assert_eq!(n.validate(), Err(DomainError::EmptyField("net name")));
     }
@@ -941,6 +959,7 @@ mod tests {
             class: NetClass::Power,
             members: vec![EntityId(2), EntityId(3)],
             current: None,
+            impedance_target: None,
         };
         assert!(n.validate().is_ok());
     }
@@ -953,6 +972,7 @@ mod tests {
             class: NetClass::Power,
             members: vec![EntityId(2), EntityId(3)],
             current: Some(PhysicalQuantity::new(2.0, Unit::Ampere)),
+            impedance_target: None,
         };
         assert!(n.validate().is_ok());
     }
@@ -966,6 +986,7 @@ mod tests {
             class: NetClass::Power,
             members: vec![EntityId(2)],
             current: Some(PhysicalQuantity::new(2.0, Unit::Millimetre)),
+            impedance_target: None,
         };
         assert!(matches!(n.validate(), Err(DomainError::Inconsistent(_))));
     }
@@ -978,6 +999,34 @@ mod tests {
             class: NetClass::Ground,
             members: vec![EntityId(2)],
             current: Some(PhysicalQuantity::new(0.0, Unit::Ampere)),
+            impedance_target: None,
+        };
+        assert!(matches!(n.validate(), Err(DomainError::Inconsistent(_))));
+    }
+
+    #[test]
+    fn net_accepts_a_finite_positive_impedance_target() {
+        let n = Net {
+            id: EntityId(1),
+            name: "USB_DP".into(),
+            class: NetClass::Signal,
+            members: vec![EntityId(2)],
+            current: None,
+            impedance_target: Some(PhysicalQuantity::new(50.0, Unit::Ohm)),
+        };
+        assert!(n.validate().is_ok());
+    }
+
+    #[test]
+    fn net_rejects_a_dimensionally_wrong_impedance_target() {
+        // A length where an impedance belongs is a dimensional error (P9).
+        let n = Net {
+            id: EntityId(1),
+            name: "USB_DP".into(),
+            class: NetClass::Signal,
+            members: vec![EntityId(2)],
+            current: None,
+            impedance_target: Some(PhysicalQuantity::new(50.0, Unit::Millimetre)),
         };
         assert!(matches!(n.validate(), Err(DomainError::Inconsistent(_))));
     }

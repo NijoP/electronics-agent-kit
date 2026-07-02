@@ -214,6 +214,7 @@ impl Machine for SchematicPlanningMachine {
                                 // load currents (a Datasheet-Intelligence / analysis input), so the
                                 // ampacity floor stays unstated here and its DRC check is silent.
                                 current: None,
+                                impedance_target: None,
                             };
                             ctx.invoke(CapabilityRequest::CreateNet { net, links: vec![] })
                                 .map_err(|e| MachineError::Internal(e.to_string()))?;
@@ -232,6 +233,7 @@ impl Machine for SchematicPlanningMachine {
                             class: NetClass::Ground,
                             members: ground_members,
                             current: None,
+                            impedance_target: None,
                         };
                         ctx.invoke(CapabilityRequest::CreateNet { net, links: vec![] })
                             .map_err(|e| MachineError::Internal(e.to_string()))?;
