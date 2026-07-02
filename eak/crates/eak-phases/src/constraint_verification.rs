@@ -11,7 +11,9 @@
 //! `docs/state-machines/constraint-verification.md`.
 
 use eak_domain::{ProvenanceLink, RelationType, Violation, ViolationStatus};
-use eak_engines::{ConstraintConsistencyRule, VerificationContext, VerificationEngine};
+use eak_engines::{
+    ConstraintConsistencyRule, ThermalJunctionRule, VerificationContext, VerificationEngine,
+};
 use eak_ports::Event;
 use eak_runtime::{AgentContext, CapabilityRequest, Machine, MachineError, StepResult};
 
@@ -22,10 +24,15 @@ impl ConstraintVerificationMachine {
         Self
     }
 
-    /// The verification engine for this phase. Phase 2 registers a single rule; ERC/DRC/DFM
-    /// rules plug into the same engine in later phases.
+    /// The verification engine for this phase: the constraint-consistency check plus the thermal
+    /// junction-temperature gate (`T_j = T_amb + θ_JA·P ≤ T_j,max`). Both read requirement-sourced
+    /// budgets, so this architecture-stage gate is their natural home — it blocks a design whose
+    /// stated power/package/ambient overheats before any layout work happens. ERC/DRC/DFM rules
+    /// plug into the same generic engine in later phases.
     fn engine() -> VerificationEngine {
-        VerificationEngine::new().with_rule(Box::new(ConstraintConsistencyRule::new()))
+        VerificationEngine::new()
+            .with_rule(Box::new(ConstraintConsistencyRule::new()))
+            .with_rule(Box::new(ThermalJunctionRule::new()))
     }
 }
 impl Default for ConstraintVerificationMachine {

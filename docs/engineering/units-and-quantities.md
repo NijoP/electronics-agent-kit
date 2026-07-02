@@ -83,6 +83,8 @@ The catalog spans the quantities electronics engineering needs (illustrative, ex
 | Inductance | henry (H) | inductor value, parasitic L |
 | Length | metre (m) / mm / mil | clearances, trace width, [Placement](../foundation/engineering-domain-model.md#placement) coordinates, board dimensions |
 | Temperature | degree Celsius (°C) / K | thermal limits, junction temperature |
+| Thermal resistance | kelvin per watt (K/W) | junction-to-ambient θ_JA in `T_j = T_amb + θ_JA·P` (a per-watt *difference*, so no Celsius-style offset) |
+| Area | square metre (m²) / cm² / mm² | copper cross-section (`A = w·t`), copper-pour area minima |
 | Power | watt (W) | dissipation, supply budget |
 | Frequency | hertz (Hz) | clock/signal rates, EMC bands |
 | Time | second (s) | timing, rise/fall |

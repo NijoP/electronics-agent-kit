@@ -1395,6 +1395,122 @@ impl Rule for DrcImpedanceMatchRule {
     }
 }
 
+// ============================ Thermal (junction-temp) ============================
+
+/// The default absolute-maximum junction temperature, in °C, for commercial silicon when a
+/// requirement does not supply its own `T_j,max` (`engineering-science/physics/thermal-physics.md`
+/// §7). An industrial/automotive part with a 150 °C rating overrides this per-requirement.
+const DEFAULT_TJ_MAX_C: f64 = 125.0;
+
+/// 0 °C in kelvin — the Celsius→Kelvin offset, used to report junction temperatures in °C.
+const KELVIN_AT_ZERO_C: f64 = 273.15;
+
+/// The first target on `req` carrying the given [`Dimension`], if any (dimension-addressed, so a
+/// θ_JA target is read by its K/W dimension regardless of position among the requirement's targets).
+fn first_target_of(req: &Requirement, dim: Dimension) -> Option<&PhysicalQuantity> {
+    req.targets.iter().find(|t| t.dimension() == dim)
+}
+
+/// The `n`-th Temperature target on `req` (slot-addressed among the Temperature targets): the
+/// thermal rule reads ambient at slot 0 and the optional `T_j,max` at slot 1, the same positional
+/// contract the Fabrication length floors use for co-dimensioned targets.
+fn nth_temperature(req: &Requirement, n: usize) -> Option<&PhysicalQuantity> {
+    req.targets
+        .iter()
+        .filter(|t| t.dimension() == Dimension::Temperature)
+        .nth(n)
+}
+
+/// Verification rule: no device's junction temperature may exceed its rated maximum. For each
+/// [`Thermal`](RequirementCategory::Thermal) requirement that states a thermal budget, the rule
+/// forms `T_j = T_amb + θ_JA·P` (`engineering-science/physics/thermal-physics.md` §4) entirely on
+/// the SI kelvin axis — θ_JA·P is a temperature *rise* (K), added to the absolute ambient — and
+/// flags it as a blocking Error when `T_j` exceeds the limit. A part that runs over its junction
+/// rating is a reliability failure the manufacturing gate must not ship.
+///
+/// INPUT SOURCE: a Thermal requirement's typed `targets` — θ_JA read by its `ThermalResistance`
+/// (K/W) dimension, `P` by its `Power` (W) dimension, `T_amb` as Temperature slot 0, and the
+/// optional `T_j,max` as Temperature slot 1 (default 125 °C commercial silicon). θ_JA is supplied
+/// explicitly (Datasheet Intelligence is a deferred phase), exactly as the fab floors are; a
+/// requirement that omits θ_JA, P, or T_amb states no thermal budget and the rule emits nothing for
+/// it rather than inventing one — the same "no input → silent" discipline as the other physics
+/// rules. Equality passes (an epsilon-guarded `T_j ≤ T_j,max`, matching the absolute-maximum
+/// framing); requirements are scanned in slice order for determinism (P4). A flagged requirement
+/// implicates itself (`Violation → Requirement → Intent`, P3).
+pub struct ThermalJunctionRule;
+
+impl ThermalJunctionRule {
+    pub const ID: &'static str = "thermal-tj";
+
+    pub fn new() -> Self {
+        Self
+    }
+}
+impl Default for ThermalJunctionRule {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Rule for ThermalJunctionRule {
+    fn id(&self) -> &str {
+        Self::ID
+    }
+
+    fn evaluate(&self, ctx: &VerificationContext) -> Vec<ViolationFinding> {
+        let mut findings = Vec::new();
+        for req in ctx
+            .requirements
+            .iter()
+            .filter(|r| r.category == RequirementCategory::Thermal)
+        {
+            // A thermal budget needs all three of θ_JA, P, and T_amb; absent any one the
+            // requirement states no computable budget and the rule emits nothing for it.
+            let (Some(theta), Some(power), Some(t_amb)) = (
+                first_target_of(req, Dimension::ThermalResistance),
+                first_target_of(req, Dimension::Power),
+                nth_temperature(req, 0),
+            ) else {
+                continue;
+            };
+            let theta_si = theta.si_magnitude();
+            let power_si = power.si_magnitude();
+            let t_amb_si = t_amb.si_magnitude();
+            if !theta_si.is_finite() || !power_si.is_finite() || !t_amb_si.is_finite() {
+                continue; // indeterminate inputs are not a silent pass, but not a computable fail.
+            }
+            // θ_JA·P is a temperature RISE (K); adding the absolute ambient (K) gives an absolute
+            // junction temperature (K). Both compared in kelvin, so authoring T_amb in °C or K is
+            // immaterial — the +273.15 offset lands on the absolutes, never on the rise.
+            let t_j_si = t_amb_si + theta_si * power_si;
+            let limit_si = nth_temperature(req, 1)
+                .map(|q| q.si_magnitude())
+                .unwrap_or(DEFAULT_TJ_MAX_C + KELVIN_AT_ZERO_C);
+            if !limit_si.is_finite() {
+                continue; // a NaN/inf authored T_j,max is indeterminate — never a silent pass.
+            }
+            let scale = t_j_si.abs().max(limit_si.abs()).max(1.0);
+            if t_j_si - limit_si > 1e-9 * scale {
+                findings.push(ViolationFinding {
+                    rule: Self::ID.to_string(),
+                    severity: ViolationSeverity::Error,
+                    subjects: vec![req.id],
+                    message: format!(
+                        "requirement {} junction temperature {:.1} degC (T_amb {:.1} degC + {} x {}) exceeds the {:.1} degC maximum",
+                        req.id.short(),
+                        t_j_si - KELVIN_AT_ZERO_C,
+                        t_amb_si - KELVIN_AT_ZERO_C,
+                        theta,
+                        power,
+                        limit_si - KELVIN_AT_ZERO_C,
+                    ),
+                });
+            }
+        }
+        findings
+    }
+}
+
 // ================================== DFM Rules ==================================
 
 /// The DEFAULT fabrication/assembly keep-out band from the board edge, in millimetres — the
@@ -2107,7 +2223,8 @@ mod tests {
         let nets = vec![net_with_current(910, NetClass::Power, 3.0)];
         // ...but route it as a 0.5 mm trace, well under the ~1.37 mm ampacity floor.
         let tracks = vec![track(10, 0.5)];
-        let findings = DrcAmpacityWidthRule::new().evaluate(&ampacity_ctx(Some(&b), &nets, &tracks));
+        let findings =
+            DrcAmpacityWidthRule::new().evaluate(&ampacity_ctx(Some(&b), &nets, &tracks));
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].rule, DrcAmpacityWidthRule::ID);
         assert_eq!(findings[0].severity, ViolationSeverity::Error);
@@ -2777,6 +2894,95 @@ mod tests {
             source: EntityId(1),
             targets: mm_targets.iter().map(|&v| mm(v)).collect(),
         }
+    }
+
+    fn thermal_req(id: u128, targets: Vec<PhysicalQuantity>) -> Requirement {
+        Requirement {
+            id: EntityId(id),
+            statement: "Thermal budget".into(),
+            category: RequirementCategory::Thermal,
+            priority: Priority::High,
+            acceptance_criterion: "junction temperature within rating".into(),
+            status: RequirementStatus::Accepted,
+            source: EntityId(1),
+            targets,
+        }
+    }
+
+    /// (θ_JA K/W, P W, T_amb °C) — the three targets that make a computable thermal budget.
+    fn budget(theta: f64, power: f64, t_amb: f64) -> Vec<PhysicalQuantity> {
+        vec![
+            PhysicalQuantity::new(theta, Unit::KelvinPerWatt),
+            PhysicalQuantity::new(power, Unit::Watt),
+            PhysicalQuantity::new(t_amb, Unit::DegreeCelsius),
+        ]
+    }
+
+    #[test]
+    fn junction_within_rating_passes() {
+        // θ=50 K/W, P=1 W, T_amb=25 °C → T_j = 75 °C, under the default 125 °C limit.
+        let reqs = vec![thermal_req(10, budget(50.0, 1.0, 25.0))];
+        assert!(ThermalJunctionRule::new()
+            .evaluate(&trace_ctx(&reqs, &[]))
+            .is_empty());
+    }
+
+    #[test]
+    fn junction_over_rating_is_flagged() {
+        // θ=100 K/W, P=1.5 W, T_amb=40 °C → T_j = 190 °C, over the 125 °C default.
+        let reqs = vec![thermal_req(10, budget(100.0, 1.5, 40.0))];
+        let findings = ThermalJunctionRule::new().evaluate(&trace_ctx(&reqs, &[]));
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule, ThermalJunctionRule::ID);
+        assert_eq!(findings[0].severity, ViolationSeverity::Error);
+        assert_eq!(findings[0].subjects, vec![EntityId(10)]);
+    }
+
+    #[test]
+    fn junction_exactly_at_the_limit_passes() {
+        // θ=80, P=1.25, T_amb=25 → T_j = 125 °C exactly; equality is not "over" (epsilon-guarded).
+        let reqs = vec![thermal_req(10, budget(80.0, 1.25, 25.0))];
+        assert!(ThermalJunctionRule::new()
+            .evaluate(&trace_ctx(&reqs, &[]))
+            .is_empty());
+    }
+
+    #[test]
+    fn supplied_tj_max_overrides_the_default() {
+        // A 130 °C device (θ=80, P=1.25, T_amb=30) fails the 125 °C default...
+        let default_reqs = vec![thermal_req(10, budget(80.0, 1.25, 30.0))];
+        assert_eq!(
+            ThermalJunctionRule::new()
+                .evaluate(&trace_ctx(&default_reqs, &[]))
+                .len(),
+            1
+        );
+        // ...but passes when the requirement supplies a 150 °C rating as Temperature slot 1.
+        let mut targets = budget(80.0, 1.25, 30.0);
+        targets.push(PhysicalQuantity::new(150.0, Unit::DegreeCelsius));
+        let rated_reqs = vec![thermal_req(11, targets)];
+        assert!(ThermalJunctionRule::new()
+            .evaluate(&trace_ctx(&rated_reqs, &[]))
+            .is_empty());
+    }
+
+    #[test]
+    fn thermal_requirement_without_a_full_budget_is_silent() {
+        // Missing θ_JA → no computable budget → no finding (even though it is over on paper).
+        let reqs = vec![thermal_req(
+            10,
+            vec![
+                PhysicalQuantity::new(1.5, Unit::Watt),
+                PhysicalQuantity::new(40.0, Unit::DegreeCelsius),
+            ],
+        )];
+        assert!(ThermalJunctionRule::new()
+            .evaluate(&trace_ctx(&reqs, &[]))
+            .is_empty());
+        // A non-Thermal requirement is ignored entirely.
+        assert!(ThermalJunctionRule::new()
+            .evaluate(&trace_ctx(&[fab_req(20, &[0.15])], &[]))
+            .is_empty());
     }
 
     fn keepout_ctx<'a>(

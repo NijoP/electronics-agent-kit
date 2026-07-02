@@ -11,16 +11,18 @@ use std::cmp::Ordering;
 /// A physical dimension. The SI base unit chosen per dimension is noted in the comment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Dimension {
-    Voltage,     // volt
-    Current,     // ampere
-    Power,       // watt
-    Length,      // metre
-    Temperature, // kelvin
-    Frequency,   // hertz
-    Time,        // second
-    Resistance,  // ohm
-    Capacitance, // farad
-    Inductance,  // henry
+    Voltage,           // volt
+    Current,           // ampere
+    Power,             // watt
+    Length,            // metre
+    Temperature,       // kelvin
+    Frequency,         // hertz
+    Time,              // second
+    Resistance,        // ohm
+    Capacitance,       // farad
+    Inductance,        // henry
+    ThermalResistance, // kelvin per watt (K/W)
+    Area,              // square metre (m²)
     Dimensionless,
 }
 
@@ -54,6 +56,10 @@ pub enum Unit {
     Henry,
     Microhenry,
     Nanohenry,
+    KelvinPerWatt,
+    SquareMetre,
+    SquareCentimetre,
+    SquareMillimetre,
     Unitless,
 }
 
@@ -71,6 +77,8 @@ impl Unit {
             Ohm | Kilohm => Dimension::Resistance,
             Farad | Microfarad | Nanofarad | Picofarad => Dimension::Capacitance,
             Henry | Microhenry | Nanohenry => Dimension::Inductance,
+            KelvinPerWatt => Dimension::ThermalResistance,
+            SquareMetre | SquareCentimetre | SquareMillimetre => Dimension::Area,
             Unitless => Dimension::Dimensionless,
         }
     }
@@ -79,9 +87,10 @@ impl Unit {
         use Unit::*;
         match self {
             Volt | Ampere | Watt | Metre | Kelvin | DegreeCelsius | Hertz | Second | Ohm
-            | Farad | Henry | Unitless => 1.0,
+            | Farad | Henry | KelvinPerWatt | SquareMetre | Unitless => 1.0,
             Millivolt | Milliampere | Milliwatt | Millimetre | Millisecond => 1e-3,
-            Microsecond | Microfarad | Microhenry => 1e-6,
+            SquareCentimetre => 1e-4, // 1 cm² = (1e-2 m)² = 1e-4 m²
+            Microsecond | Microfarad | Microhenry | SquareMillimetre => 1e-6, // 1 mm² = 1e-6 m²
             Nanofarad | Nanohenry => 1e-9,
             Picofarad => 1e-12,
             Mil => 2.54e-5,
@@ -126,6 +135,10 @@ impl Unit {
             Henry => "H",
             Microhenry => "uH",
             Nanohenry => "nH",
+            KelvinPerWatt => "K/W",
+            SquareMetre => "m^2",
+            SquareCentimetre => "cm^2",
+            SquareMillimetre => "mm^2",
             Unitless => "",
         }
     }
@@ -274,5 +287,49 @@ mod tests {
         let limit = PhysicalQuantity::new(5.0, Unit::Watt);
         let measured = PhysicalQuantity::new(4200.0, Unit::Milliwatt);
         assert_eq!(measured.try_compare(&limit).unwrap(), Ordering::Less);
+    }
+
+    #[test]
+    fn thermal_resistance_dimension_and_no_offset() {
+        // K/W is a ratio of a temperature *difference* to power — a base unit with NO Celsius-style
+        // offset, so si_magnitude is the value itself.
+        let theta = PhysicalQuantity::new(50.0, Unit::KelvinPerWatt);
+        assert_eq!(theta.dimension(), Dimension::ThermalResistance);
+        assert!((theta.si_magnitude() - 50.0).abs() < 1e-9);
+        assert_eq!(Unit::KelvinPerWatt.symbol(), "K/W");
+    }
+
+    #[test]
+    fn area_units_normalize_to_square_metres() {
+        // 1 mm² = 1e-6 m², 1 cm² = 1e-4 m², 1 m² is the base.
+        assert!(
+            (PhysicalQuantity::new(1.0, Unit::SquareMillimetre).si_magnitude() - 1e-6).abs()
+                < 1e-18
+        );
+        assert!(
+            (PhysicalQuantity::new(1.0, Unit::SquareCentimetre).si_magnitude() - 1e-4).abs()
+                < 1e-16
+        );
+        assert!((PhysicalQuantity::new(1.0, Unit::SquareMetre).si_magnitude() - 1.0).abs() < 1e-12);
+        // 100 mm² equals 1 cm² across the two area units.
+        let a = PhysicalQuantity::new(100.0, Unit::SquareMillimetre);
+        let b = PhysicalQuantity::new(1.0, Unit::SquareCentimetre);
+        assert!(a.same_value(&b).unwrap());
+        for u in [
+            Unit::SquareMillimetre,
+            Unit::SquareCentimetre,
+            Unit::SquareMetre,
+        ] {
+            assert_eq!(u.dimension(), Dimension::Area);
+        }
+    }
+
+    #[test]
+    fn thermal_resistance_never_compares_to_a_temperature() {
+        // A θ in K/W and a temperature in K are different dimensions — comparison is a type error,
+        // never a silent kelvin-vs-K/W confusion (P9).
+        let theta = PhysicalQuantity::new(50.0, Unit::KelvinPerWatt);
+        let temp = PhysicalQuantity::new(50.0, Unit::Kelvin);
+        assert!(theta.try_compare(&temp).is_err());
     }
 }
