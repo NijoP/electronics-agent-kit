@@ -210,6 +210,10 @@ impl Machine for SchematicPlanningMachine {
                                 name: name.into(),
                                 class: NetClass::Power,
                                 members,
+                                // Deterministic Schematic Planning does not yet derive per-net
+                                // load currents (a Datasheet-Intelligence / analysis input), so the
+                                // ampacity floor stays unstated here and its DRC check is silent.
+                                current: None,
                             };
                             ctx.invoke(CapabilityRequest::CreateNet { net, links: vec![] })
                                 .map_err(|e| MachineError::Internal(e.to_string()))?;
@@ -227,6 +231,7 @@ impl Machine for SchematicPlanningMachine {
                             name: "GND".into(),
                             class: NetClass::Ground,
                             members: ground_members,
+                            current: None,
                         };
                         ctx.invoke(CapabilityRequest::CreateNet { net, links: vec![] })
                             .map_err(|e| MachineError::Internal(e.to_string()))?;

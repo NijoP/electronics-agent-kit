@@ -87,12 +87,15 @@ stateDiagram-v2
 
 ## Phase-3 implementation note
 
-The shipped `DrcVerificationMachine` (in `eak-phases`) runs four deterministic rules on the shared [Verification Engine](../engineering/verification-engine.md) framework over the routed [PCB IR](../compiler/ir/pcb-ir.md):
+The shipped `DrcVerificationMachine` (in `eak-phases`) runs seven deterministic rules on the shared [Verification Engine](../engineering/verification-engine.md) framework over the routed [PCB IR](../compiler/ir/pcb-ir.md):
 
 - `drc-out-of-bounds` — every placement courtyard must lie within the board outline.
 - `drc-courtyard-overlap` — no two same-side courtyards may overlap (AABB, open-set).
 - `drc-trace-width` — every routed track must meet the fabrication **process floor**: the first length target on a [`Fabrication`](../foundation/engineering-domain-model.md) requirement (a process limit — *not* `Regulatory`, which is for external standards/compliance). Silent when no process floor is stated.
 - `drc-unrouted-net` — every committed net must be realized by at least one routed track; an unrouted net is an electrical break. Because Routing Planning runs before DRC and realizes one track per net, this is a completeness *guard* (silent on a normal run) that turns the upstream "every component is placed" invariant into a first-class, traceable violation rather than a silent assumption.
+- `drc-net-open` — every member pad of a net must land on that net's copper (topological open-detection): a net realized by copper that fails to *join* all its pads is still electrically broken even though `drc-unrouted-net` is satisfied.
+- `drc-copper-clearance` — two same-side traces of different nets must keep at least the minimum copper-to-copper spacing (**slot 2** of the `Fabrication` length targets); closer copper risks an acid-trap or solder bridge (a short). Silent — and deliberately without a constant fallback — until a clearance floor is stated.
+- `drc-ampacity-width` — every routed track whose net states a `current` must be wide enough to carry that current within a conservative self-heating rise (IPC-2221 external curve, evaluated on the net's current and the track's layer copper thickness from the [`LayerStack`]). The process floor (`drc-trace-width`) and this current floor are co-equal siblings, so the effective width floor is `max(process, ampacity)`. Silent when a net states no current or no board exists; the IR-drop half of the DC floor is a documented future term.
 
 Each finding is raised as a `Violation` linked to the implicated placement/track/net (full provenance to intent), deduped by rule + subjects across loop-back re-verification, and the gate scopes to its **own** rules via `count_open_blocking` (per-phase gating). `Failed` loops back to Routing Planning. The HITL triage/disposition states above are the documented target; the deterministic build raises and gates without an interactive agent.
 

@@ -236,6 +236,7 @@ mod kernel_tests {
                 name: "+5V".into(),
                 class: NetClass::Power,
                 members: vec![pid],
+                current: None,
             },
             links: vec![],
         })
@@ -611,6 +612,7 @@ mod kernel_tests {
                     name: "GND".into(),
                     class: NetClass::Ground,
                     members: vec![],
+                    current: None,
                 },
                 links: vec![],
             })
@@ -862,6 +864,7 @@ mod kernel_tests {
                 name: "VBUS".into(),
                 class: NetClass::Power,
                 members: vec![pin_id],
+                current: None,
             },
             links: vec![],
         })

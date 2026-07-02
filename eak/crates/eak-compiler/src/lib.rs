@@ -513,6 +513,7 @@ mod tests {
             name: "VCC".into(),
             class: NetClass::Power,
             members,
+            current: None,
         }
     }
 

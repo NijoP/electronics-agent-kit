@@ -5,7 +5,7 @@
 //! [`ProvenanceLink`]. Downstream entities (Component, Net, Constraint, ...) are NOT
 //! modelled in Phase 1. See `docs/foundation/engineering-domain-model.md`.
 
-use eak_units::{PhysicalQuantity, Unit};
+use eak_units::{Dimension, PhysicalQuantity, Unit};
 use serde::{Deserialize, Serialize};
 
 /// Opaque, immutable identity (domain-model modelling principle 1). Carries no meaning;
@@ -353,22 +353,42 @@ pub struct Pin {
 }
 
 /// A first-class electrical connection joining a set of [`Pin`]s. Made addressable so ERC
-/// findings can name the offending net and trace it (P3, P13).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// findings can name the offending net and trace it (P3, P13). The optional `current` is the
+/// net's worst-case DC load — physically the KCL sum of its consumers (see
+/// `engineering-science/electrical/kirchhoff-laws.md`) — a typed Current [`PhysicalQuantity`]
+/// (P9). It is the per-net input to the ampacity trace-width floor (`drc-ampacity-width`): a net
+/// that states no current gets no DC sizing floor, so that check stays silent rather than
+/// inventing one. Carrying an optional `PhysicalQuantity` makes `Net` not `Eq` (exactly like
+/// [`Component`]/[`Board`]/[`Track`]); nets are addressed by [`EntityId`], never by equality.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Net {
     pub id: EntityId,
     pub name: String,
     pub class: NetClass,
     /// The pin ids joined by this net.
     pub members: Vec<EntityId>,
+    /// The net's worst-case DC current, if known (a typed Current quantity). `None` = unstated,
+    /// in which case the ampacity width floor is not computed for this net.
+    pub current: Option<PhysicalQuantity>,
 }
 
 impl Net {
-    /// Domain invariant: a net carries a non-empty name. Member-pin integrity (each id
-    /// exists) is re-checked at the capability seam (P3).
+    /// Domain invariant: a net carries a non-empty name; and if a `current` is stated it is a
+    /// finite, positive Current quantity — a net cannot carry a negative or dimensionally-wrong
+    /// load (P9). Member-pin integrity (each id exists) is re-checked at the capability seam (P3).
     pub fn validate(&self) -> Result<(), DomainError> {
         if self.name.trim().is_empty() {
             return Err(DomainError::EmptyField("net name"));
+        }
+        if let Some(current) = &self.current {
+            if current.dimension() != Dimension::Current
+                || !current.si_magnitude().is_finite()
+                || current.si_magnitude() <= 0.0
+            {
+                return Err(DomainError::Inconsistent(
+                    "net current must be a finite, positive Current quantity",
+                ));
+            }
         }
         Ok(())
     }
@@ -908,6 +928,7 @@ mod tests {
             name: "".into(),
             class: NetClass::Power,
             members: vec![EntityId(2), EntityId(3)],
+            current: None,
         };
         assert_eq!(n.validate(), Err(DomainError::EmptyField("net name")));
     }
@@ -919,8 +940,46 @@ mod tests {
             name: "+5V".into(),
             class: NetClass::Power,
             members: vec![EntityId(2), EntityId(3)],
+            current: None,
         };
         assert!(n.validate().is_ok());
+    }
+
+    #[test]
+    fn net_accepts_a_finite_positive_current() {
+        let n = Net {
+            id: EntityId(1),
+            name: "+5V".into(),
+            class: NetClass::Power,
+            members: vec![EntityId(2), EntityId(3)],
+            current: Some(PhysicalQuantity::new(2.0, Unit::Ampere)),
+        };
+        assert!(n.validate().is_ok());
+    }
+
+    #[test]
+    fn net_rejects_a_dimensionally_wrong_current() {
+        // A length where a current belongs is a dimensional error (P9).
+        let n = Net {
+            id: EntityId(1),
+            name: "+5V".into(),
+            class: NetClass::Power,
+            members: vec![EntityId(2)],
+            current: Some(PhysicalQuantity::new(2.0, Unit::Millimetre)),
+        };
+        assert!(matches!(n.validate(), Err(DomainError::Inconsistent(_))));
+    }
+
+    #[test]
+    fn net_rejects_a_non_positive_current() {
+        let n = Net {
+            id: EntityId(1),
+            name: "GND".into(),
+            class: NetClass::Ground,
+            members: vec![EntityId(2)],
+            current: Some(PhysicalQuantity::new(0.0, Unit::Ampere)),
+        };
+        assert!(matches!(n.validate(), Err(DomainError::Inconsistent(_))));
     }
 
     #[test]

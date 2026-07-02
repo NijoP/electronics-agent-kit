@@ -6,11 +6,11 @@
 //! See `docs/engineering/constraint-engine.md` and `docs/engineering/verification-engine.md`.
 
 use eak_domain::{
-    Board, BomLineItem, Component, ComponentClass, Constraint, ConstraintKind, EntityId, Net,
-    NetClass, Part, PartLifecycle, Pin, PinElectricalType, Placement, Requirement,
+    Board, BoardSide, BomLineItem, Component, ComponentClass, Constraint, ConstraintKind, EntityId,
+    LayerStack, Net, NetClass, Part, PartLifecycle, Pin, PinElectricalType, Placement, Requirement,
     RequirementCategory, Track, Violation, ViolationSeverity,
 };
-use eak_units::{Dimension, PhysicalQuantity, UnitError};
+use eak_units::{Dimension, PhysicalQuantity, Unit, UnitError};
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
 
@@ -1100,6 +1100,135 @@ impl Rule for DrcCopperClearanceRule {
     }
 }
 
+// IPC-2221 external-layer current-capacity curve `I = k·ΔT^0.44·A^0.725` (A in mil², ΔT in °C,
+// I in A), inverted to size the copper. Routing lays every Track on an OUTER `BoardSide`
+// (Top/Bottom), so the external coefficient applies and the internal-layer 0.024 is unused today.
+const AMPACITY_K_EXTERNAL: f64 = 0.048;
+const AMPACITY_DELTA_T_EXP: f64 = 0.44; // b — the ΔT exponent
+const AMPACITY_AREA_EXP: f64 = 0.725; // c — the cross-section exponent
+/// The conservative default allowable copper temperature rise, in °C, for the self-heating floor.
+/// A fixed first-order DC proxy (IPC-2221), documented as such — a denser design may allow less; a
+/// supplied per-net rise is a later refinement, not a fabricated figure (the same deferred-input
+/// discipline the copper-clearance voltage scaling and EMC velocity factor follow).
+const AMPACITY_TEMP_RISE_C: f64 = 10.0;
+/// mil² → mm²: one mil is 0.0254 mm, so one mil² is `0.0254² = 6.4516e-4` mm².
+const MIL2_TO_MM2: f64 = 6.4516e-4;
+
+/// The minimum external-copper trace width, in millimetres, that carries `current_a` amperes
+/// within the conservative self-heating rise: the IPC-2221 curve `I = k·ΔT^0.44·A^0.725` inverted
+/// for the cross-section `A`, then divided by the copper thickness to get a width. `thickness_mm`
+/// is the layer copper thickness read from the board's [`LayerStack`] — the increment-12 keystone:
+/// without a real `t` this floor is uncomputable in principle, not merely unchecked. A first-order
+/// DC proxy at a fixed 10 °C rise on an external layer; the IR-drop floor is a separate future term
+/// (it needs a per-net voltage budget and a source-to-load path length). Pure and deterministic.
+fn ampacity_min_width_mm(current_a: f64, thickness_mm: f64) -> f64 {
+    let denom = AMPACITY_K_EXTERNAL * AMPACITY_TEMP_RISE_C.powf(AMPACITY_DELTA_T_EXP);
+    let area_mil2 = (current_a / denom).powf(1.0 / AMPACITY_AREA_EXP);
+    let area_mm2 = area_mil2 * MIL2_TO_MM2;
+    area_mm2 / thickness_mm
+}
+
+/// The copper thickness, in millimetres, of the stack layer a [`Track`] on `side` rides on.
+/// Routing lays tracks on an outer [`BoardSide`], and a [`LayerStack`] is ordered top→bottom, so
+/// `Top` maps to the first (top) layer and `Bottom` to the last (bottom) layer. `None` when the
+/// stack carries no layers (a malformed board — caught by `Board::validate`).
+fn layer_copper_thickness_mm(stack: &LayerStack, side: BoardSide) -> Option<f64> {
+    let layer = match side {
+        BoardSide::Top => stack.layers.first(),
+        BoardSide::Bottom => stack.layers.last(),
+    }?;
+    Some(layer.copper_thickness.si_magnitude() * 1e3)
+}
+
+/// DRC rule: every routed [`Track`] whose [`Net`] states a `current` must have copper `width` at
+/// least the net's ampacity floor — the width that keeps that current inside a conservative
+/// self-heating temperature rise (IPC-2221, `engineering-science/electrical/ohms-law.md` §6). The
+/// floor is [`ampacity_min_width_mm`] evaluated on the net's stated current and the track's layer
+/// copper thickness from the board [`LayerStack`] (the increment-12 keystone paying off: a real `t`
+/// makes `A = w·t` computable). A track finer than the floor cannot carry its net's current without
+/// exceeding the rise — a rail that overheats — so it is a blocking Error.
+///
+/// CURRENT SOURCE: the per-net [`Net::current`]. A net that states NO current gets no DC ampacity
+/// floor and the rule emits nothing for it rather than inventing a current — the per-net form of
+/// [`DrcTraceWidthRule`]'s and [`DrcCopperClearanceRule`]'s "no input → silent" discipline. With no
+/// board there is no stack to read `t` from, so the rule is likewise silent. The manufacturing
+/// process floor stays independently enforced by [`DrcTraceWidthRule`] (slot 0), so the effective
+/// combined floor is `max(ampacity, process)`; the IR-drop term is a documented future refinement.
+///
+/// This is a CHECKER, not an actuator: Routing still stamps a per-class default width, so a
+/// current-carrying net finer than its floor is flagged and looped back (the generic gate), exactly
+/// as the trace-width rule behaves — sizing the width to satisfy the floor is the separate
+/// closed-loop-actuation move. Comparisons are on the SI axis via `si_magnitude()` with the same
+/// `1e-9·scale` epsilon the other width/clearance rules use, so copper exactly at the floor is never
+/// a false positive; tracks are scanned in slice order for determinism (P4). A flagged track
+/// implicates itself (`Violation → Track → Net → … → Requirement → Intent`, P3).
+pub struct DrcAmpacityWidthRule;
+
+impl DrcAmpacityWidthRule {
+    pub const ID: &'static str = "drc-ampacity-width";
+
+    pub fn new() -> Self {
+        Self
+    }
+}
+impl Default for DrcAmpacityWidthRule {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Rule for DrcAmpacityWidthRule {
+    fn id(&self) -> &str {
+        Self::ID
+    }
+
+    fn evaluate(&self, ctx: &VerificationContext) -> Vec<ViolationFinding> {
+        // Copper thickness comes from the board's LayerStack; with no board there is no stack to
+        // size against, so the rule stays silent (mirrors the geometry rules).
+        let Some(board) = ctx.board else {
+            return Vec::new();
+        };
+        let mut findings = Vec::new();
+        for track in ctx.tracks.iter() {
+            // Only nets that STATE a current get a DC ampacity floor; absent one, emit nothing
+            // rather than inventing a current (the per-net "no input → silent" discipline).
+            let Some(net) = ctx.nets.iter().find(|n| n.id == track.net) else {
+                continue;
+            };
+            let Some(current) = net.current.as_ref() else {
+                continue;
+            };
+            let current_a = current.si_magnitude();
+            if !current_a.is_finite() || current_a <= 0.0 {
+                continue; // Net::validate rejects these; defensive skip keeps the rule total.
+            }
+            let Some(thickness_mm) = layer_copper_thickness_mm(&board.stack, track.layer) else {
+                continue;
+            };
+            let floor_mm = ampacity_min_width_mm(current_a, thickness_mm);
+            let floor_si = floor_mm * 1e-3;
+            let width_si = track.width.si_magnitude();
+            let scale = width_si.abs().max(floor_si.abs()).max(1.0);
+            if floor_si - width_si > 1e-9 * scale {
+                findings.push(ViolationFinding {
+                    rule: Self::ID.to_string(),
+                    severity: ViolationSeverity::Error,
+                    subjects: vec![track.id],
+                    message: format!(
+                        "track {} width {} is finer than the {} ampacity floor for net {}'s {} load",
+                        track.id.short(),
+                        track.width,
+                        PhysicalQuantity::new(floor_mm, Unit::Millimetre),
+                        net.id.short(),
+                        current,
+                    ),
+                });
+            }
+        }
+        findings
+    }
+}
+
 // ================================== DFM Rules ==================================
 
 /// The DEFAULT fabrication/assembly keep-out band from the board edge, in millimetres — the
@@ -1509,6 +1638,17 @@ mod tests {
             name: format!("NET{id}"),
             class,
             members: members.into_iter().map(EntityId).collect(),
+            current: None,
+        }
+    }
+
+    fn net_with_current(id: u128, class: NetClass, current_a: f64) -> Net {
+        Net {
+            id: EntityId(id),
+            name: format!("NET{id}"),
+            class,
+            members: vec![],
+            current: Some(PhysicalQuantity::new(current_a, Unit::Ampere)),
         }
     }
 
@@ -1748,6 +1888,83 @@ mod tests {
             placements,
             tracks: &[],
         }
+    }
+
+    fn ampacity_ctx<'a>(
+        board: Option<&'a Board>,
+        nets: &'a [Net],
+        tracks: &'a [Track],
+    ) -> VerificationContext<'a> {
+        VerificationContext {
+            requirements: &[],
+            constraints: &[],
+            components: &[],
+            pins: &[],
+            nets,
+            parts: &[],
+            bom_line_items: &[],
+            board,
+            placements: &[],
+            tracks,
+        }
+    }
+
+    #[test]
+    fn ampacity_width_matches_the_ipc_2221_external_curve() {
+        // 3 A on 1 oz (0.035 mm) external copper at the conservative 10 °C rise needs ~1.37 mm
+        // (IPC-2221 inverted). Asserted to ±0.01 mm so the closed form is pinned, not approximated.
+        let w = ampacity_min_width_mm(3.0, 0.035);
+        assert!((w - 1.367).abs() < 0.01, "expected ~1.367 mm, got {w}");
+        // Twice the copper (2 oz) carries the same current in strictly less width.
+        assert!(ampacity_min_width_mm(3.0, 0.070) < w);
+        // A 50 mA signal current needs far less copper than any real trace width.
+        assert!(ampacity_min_width_mm(0.05, 0.035) < 0.01);
+    }
+
+    #[test]
+    fn underwidth_current_carrying_track_is_flagged() {
+        let b = board(1, 100.0, 80.0);
+        // track(10) realizes net EntityId(910); give that net a 3 A load...
+        let nets = vec![net_with_current(910, NetClass::Power, 3.0)];
+        // ...but route it as a 0.5 mm trace, well under the ~1.37 mm ampacity floor.
+        let tracks = vec![track(10, 0.5)];
+        let findings = DrcAmpacityWidthRule::new().evaluate(&ampacity_ctx(Some(&b), &nets, &tracks));
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule, DrcAmpacityWidthRule::ID);
+        assert_eq!(findings[0].severity, ViolationSeverity::Error);
+        assert_eq!(findings[0].subjects, vec![EntityId(10)]);
+    }
+
+    #[test]
+    fn track_at_or_above_the_ampacity_floor_passes() {
+        let b = board(1, 100.0, 80.0);
+        let nets = vec![net_with_current(910, NetClass::Power, 3.0)];
+        // 2 mm comfortably exceeds the ~1.37 mm floor for 3 A on 1 oz copper.
+        let tracks = vec![track(10, 2.0)];
+        assert!(DrcAmpacityWidthRule::new()
+            .evaluate(&ampacity_ctx(Some(&b), &nets, &tracks))
+            .is_empty());
+    }
+
+    #[test]
+    fn net_without_a_stated_current_has_no_ampacity_floor() {
+        let b = board(1, 100.0, 80.0);
+        // No current on the net: the rule invents none, so even an absurdly thin trace is silent.
+        let nets = vec![net(910, NetClass::Signal, vec![])];
+        let tracks = vec![track(10, 0.05)];
+        assert!(DrcAmpacityWidthRule::new()
+            .evaluate(&ampacity_ctx(Some(&b), &nets, &tracks))
+            .is_empty());
+    }
+
+    #[test]
+    fn ampacity_is_silent_without_a_board() {
+        // No board → no LayerStack → no copper thickness to size against, so the rule is silent.
+        let nets = vec![net_with_current(910, NetClass::Power, 3.0)];
+        let tracks = vec![track(10, 0.5)];
+        assert!(DrcAmpacityWidthRule::new()
+            .evaluate(&ampacity_ctx(None, &nets, &tracks))
+            .is_empty());
     }
 
     #[test]

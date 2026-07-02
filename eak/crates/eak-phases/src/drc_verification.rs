@@ -17,8 +17,9 @@
 
 use eak_domain::{ProvenanceLink, RelationType, Violation, ViolationStatus};
 use eak_engines::{
-    DrcCopperClearanceRule, DrcCourtyardOverlapRule, DrcNetOpenRule, DrcOutOfBoundsRule,
-    DrcTraceWidthRule, DrcUnroutedNetRule, VerificationContext, VerificationEngine,
+    DrcAmpacityWidthRule, DrcCopperClearanceRule, DrcCourtyardOverlapRule, DrcNetOpenRule,
+    DrcOutOfBoundsRule, DrcTraceWidthRule, DrcUnroutedNetRule, VerificationContext,
+    VerificationEngine,
 };
 use eak_ports::Event;
 use eak_runtime::{AgentContext, CapabilityRequest, Machine, MachineError, StepResult};
@@ -30,11 +31,12 @@ impl DrcVerificationMachine {
         Self
     }
 
-    /// The verification engine for this phase: the six Phase-3 DRC rules — two placement geometry
-    /// checks, the routing trace-width check, the net-realization completeness check, the
-    /// net-connectivity (open-detection) check, and the copper-to-copper clearance (short-margin)
-    /// check — registered against the same generic framework that Constraint, ERC, and BOM
-    /// Verification use (reuse: one framework, many checks).
+    /// The verification engine for this phase: the seven Phase-3 DRC rules — two placement geometry
+    /// checks, the routing trace-width (process-floor) check, the net-realization completeness
+    /// check, the net-connectivity (open-detection) check, the copper-to-copper clearance
+    /// (short-margin) check, and the ampacity trace-width (current-carrying) check — registered
+    /// against the same generic framework that Constraint, ERC, and BOM Verification use (reuse:
+    /// one framework, many checks).
     fn engine() -> VerificationEngine {
         VerificationEngine::new()
             .with_rule(Box::new(DrcOutOfBoundsRule::new()))
@@ -43,6 +45,7 @@ impl DrcVerificationMachine {
             .with_rule(Box::new(DrcUnroutedNetRule::new()))
             .with_rule(Box::new(DrcNetOpenRule::new()))
             .with_rule(Box::new(DrcCopperClearanceRule::new()))
+            .with_rule(Box::new(DrcAmpacityWidthRule::new()))
     }
 }
 impl Default for DrcVerificationMachine {
